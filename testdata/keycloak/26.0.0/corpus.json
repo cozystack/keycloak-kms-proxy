@@ -1,0 +1,439 @@
+{
+  "version": "26.0.0",
+  "entities": [
+    {
+      "class": "CredentialEntity",
+      "package": "org.keycloak.models.jpa.entities",
+      "table": "CREDENTIAL",
+      "columns": [
+        {
+          "field": "createdDate",
+          "name": "CREATED_DATE"
+        },
+        {
+          "field": "credentialData",
+          "name": "CREDENTIAL_DATA"
+        },
+        {
+          "field": "id",
+          "name": "ID"
+        },
+        {
+          "field": "priority",
+          "name": "PRIORITY"
+        },
+        {
+          "field": "salt",
+          "name": "SALT"
+        },
+        {
+          "field": "secretData",
+          "name": "SECRET_DATA"
+        },
+        {
+          "field": "type",
+          "name": "TYPE"
+        },
+        {
+          "field": "userLabel",
+          "name": "USER_LABEL"
+        }
+      ],
+      "queries": [
+        {
+          "name": "credentialByUser",
+          "jpql": "select cred from CredentialEntity cred where cred.user = :user order by cred.priority"
+        },
+        {
+          "name": "deleteCredentialsByRealm",
+          "jpql": "delete from CredentialEntity cred where cred.user IN (select u from UserEntity u where u.realmId=:realmId)"
+        },
+        {
+          "name": "deleteCredentialsByRealmAndLink",
+          "jpql": "delete from CredentialEntity cred where cred.user IN (select u from UserEntity u where u.realmId=:realmId and u.federationLink=:link)"
+        }
+      ]
+    },
+    {
+      "class": "FederatedIdentityEntity",
+      "package": "org.keycloak.models.jpa.entities",
+      "table": "FEDERATED_IDENTITY",
+      "columns": [
+        {
+          "field": "userName",
+          "name": "FEDERATED_USERNAME"
+        },
+        {
+          "field": "userId",
+          "name": "FEDERATED_USER_ID"
+        },
+        {
+          "field": "identityProvider",
+          "name": "IDENTITY_PROVIDER"
+        },
+        {
+          "field": "realmId",
+          "name": "REALM_ID"
+        },
+        {
+          "field": "token",
+          "name": "TOKEN"
+        }
+      ],
+      "queries": [
+        {
+          "name": "deleteFederatedIdentityByProvider",
+          "jpql": "delete from FederatedIdentityEntity fdi where fdi.realmId = :realmId and fdi.identityProvider = :providerAlias"
+        },
+        {
+          "name": "deleteFederatedIdentityByRealm",
+          "jpql": "delete from FederatedIdentityEntity social where social.user IN (select u from UserEntity u where realmId=:realmId)"
+        },
+        {
+          "name": "deleteFederatedIdentityByRealmAndLink",
+          "jpql": "delete from FederatedIdentityEntity social where social.user IN (select u from UserEntity u where realmId=:realmId and u.federationLink=:link)"
+        },
+        {
+          "name": "deleteFederatedIdentityByUser",
+          "jpql": "delete from FederatedIdentityEntity social where social.user = :user"
+        },
+        {
+          "name": "findFederatedIdentityByUser",
+          "jpql": "select link from FederatedIdentityEntity link where link.user = :user"
+        },
+        {
+          "name": "findFederatedIdentityByUserAndProvider",
+          "jpql": "select link from FederatedIdentityEntity link where link.user = :user and link.identityProvider = :identityProvider"
+        },
+        {
+          "name": "findUserByFederatedIdentityAndRealm",
+          "jpql": "select link.user from FederatedIdentityEntity link where link.realmId = :realmId and link.identityProvider = :identityProvider and link.userId = :userId"
+        }
+      ]
+    },
+    {
+      "class": "FederatedUserAttributeEntity",
+      "package": "org.keycloak.storage.jpa.entity",
+      "table": "FED_USER_ATTRIBUTE",
+      "columns": [
+        {
+          "field": "id",
+          "name": "ID"
+        },
+        {
+          "field": "longValue",
+          "name": "LONG_VALUE"
+        },
+        {
+          "field": "longValueHash",
+          "name": "LONG_VALUE_HASH"
+        },
+        {
+          "field": "longValueHashLowerCase",
+          "name": "LONG_VALUE_HASH_LOWER_CASE"
+        },
+        {
+          "field": "name",
+          "name": "NAME"
+        },
+        {
+          "field": "realmId",
+          "name": "REALM_ID"
+        },
+        {
+          "field": "storageProviderId",
+          "name": "STORAGE_PROVIDER_ID"
+        },
+        {
+          "field": "userId",
+          "name": "USER_ID"
+        },
+        {
+          "field": "value",
+          "name": "VALUE"
+        }
+      ],
+      "queries": [
+        {
+          "name": "deleteFederatedAttributesByStorageProvider",
+          "jpql": "delete from FederatedUserAttributeEntity e where e.storageProviderId=:storageProviderId"
+        },
+        {
+          "name": "deleteUserFederatedAttributesByRealm",
+          "jpql": "delete from FederatedUserAttributeEntity attr where attr.realmId=:realmId"
+        },
+        {
+          "name": "deleteUserFederatedAttributesByRealmAndLink",
+          "jpql": "delete from FederatedUserAttributeEntity attr where attr.userId IN (select u.id from UserEntity u where u.realmId=:realmId and u.federationLink=:link)"
+        },
+        {
+          "name": "deleteUserFederatedAttributesByUser",
+          "jpql": "delete from FederatedUserAttributeEntity attr where attr.userId = :userId and attr.realmId=:realmId"
+        },
+        {
+          "name": "deleteUserFederatedAttributesByUserAndName",
+          "jpql": "delete from FederatedUserAttributeEntity attr where attr.userId = :userId and attr.name=:name and attr.realmId=:realmId"
+        },
+        {
+          "name": "getFederatedAttributesByNameAndLongValue",
+          "jpql": "select attr.userId, attr.longValue from FederatedUserAttributeEntity attr where attr.name = :name and attr.longValueHash = :longValueHash and attr.realmId=:realmId"
+        },
+        {
+          "name": "getFederatedAttributesByNameAndValue",
+          "jpql": "select attr.userId from FederatedUserAttributeEntity attr where attr.name = :name and attr.value = :value and attr.realmId=:realmId"
+        },
+        {
+          "name": "getFederatedAttributesByUser",
+          "jpql": "select attr from FederatedUserAttributeEntity attr where attr.userId = :userId and attr.realmId=:realmId"
+        }
+      ]
+    },
+    {
+      "class": "FederatedUserCredentialEntity",
+      "package": "org.keycloak.storage.jpa.entity",
+      "table": "FED_USER_CREDENTIAL",
+      "columns": [
+        {
+          "field": "createdDate",
+          "name": "CREATED_DATE"
+        },
+        {
+          "field": "credentialData",
+          "name": "CREDENTIAL_DATA"
+        },
+        {
+          "field": "id",
+          "name": "ID"
+        },
+        {
+          "field": "priority",
+          "name": "PRIORITY"
+        },
+        {
+          "field": "realmId",
+          "name": "REALM_ID"
+        },
+        {
+          "field": "salt",
+          "name": "SALT"
+        },
+        {
+          "field": "secretData",
+          "name": "SECRET_DATA"
+        },
+        {
+          "field": "storageProviderId",
+          "name": "STORAGE_PROVIDER_ID"
+        },
+        {
+          "field": "type",
+          "name": "TYPE"
+        },
+        {
+          "field": "userId",
+          "name": "USER_ID"
+        },
+        {
+          "field": "userLabel",
+          "name": "USER_LABEL"
+        }
+      ],
+      "queries": [
+        {
+          "name": "deleteFederatedUserCredentialByUser",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.userId = :userId and cred.realmId = :realmId"
+        },
+        {
+          "name": "deleteFederatedUserCredentialByUserAndType",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.userId = :userId and cred.type = :type"
+        },
+        {
+          "name": "deleteFederatedUserCredentialByUserAndTypeAndUserLabel",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.userId = :userId and cred.type = :type and cred.userLabel = :userLabel"
+        },
+        {
+          "name": "deleteFederatedUserCredentialsByRealm",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.realmId=:realmId"
+        },
+        {
+          "name": "deleteFederatedUserCredentialsByRealmAndLink",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.userId IN (select u.id from UserEntity u where u.realmId=:realmId and u.federationLink=:link)"
+        },
+        {
+          "name": "deleteFederatedUserCredentialsByStorageProvider",
+          "jpql": "delete from FederatedUserCredentialEntity cred where cred.storageProviderId=:storageProviderId"
+        },
+        {
+          "name": "federatedUserCredentialByNameAndType",
+          "jpql": "select cred from FederatedUserCredentialEntity cred where cred.userId = :userId and cred.type = :type and cred.userLabel = :userLabel order by cred.priority"
+        },
+        {
+          "name": "federatedUserCredentialByUser",
+          "jpql": "select cred from FederatedUserCredentialEntity cred where cred.userId = :userId order by cred.priority"
+        },
+        {
+          "name": "federatedUserCredentialByUserAndType",
+          "jpql": "select cred from FederatedUserCredentialEntity cred where cred.userId = :userId and cred.type = :type order by cred.priority"
+        }
+      ]
+    },
+    {
+      "class": "UserAttributeEntity",
+      "package": "org.keycloak.models.jpa.entities",
+      "table": "USER_ATTRIBUTE",
+      "columns": [
+        {
+          "field": "id",
+          "name": "ID"
+        },
+        {
+          "field": "longValue",
+          "name": "LONG_VALUE"
+        },
+        {
+          "field": "longValueHash",
+          "name": "LONG_VALUE_HASH"
+        },
+        {
+          "field": "longValueHashLowerCase",
+          "name": "LONG_VALUE_HASH_LOWER_CASE"
+        },
+        {
+          "field": "name",
+          "name": "NAME"
+        },
+        {
+          "field": "value",
+          "name": "VALUE"
+        }
+      ],
+      "queries": [
+        {
+          "name": "deleteUserAttributesByNameAndUser",
+          "jpql": "delete from UserAttributeEntity attr where attr.user.id = :userId and attr.name = :name"
+        },
+        {
+          "name": "deleteUserAttributesByNameAndUserOtherThan",
+          "jpql": "delete from UserAttributeEntity attr where attr.user.id = :userId and attr.name = :name and attr.id <> :attrId"
+        },
+        {
+          "name": "deleteUserAttributesByRealm",
+          "jpql": "delete from UserAttributeEntity attr where attr.user IN (select u from UserEntity u where u.realmId=:realmId)"
+        },
+        {
+          "name": "deleteUserAttributesByRealmAndLink",
+          "jpql": "delete from UserAttributeEntity attr where attr.user IN (select u from UserEntity u where u.realmId=:realmId and u.federationLink=:link)"
+        }
+      ]
+    },
+    {
+      "class": "UserEntity",
+      "package": "org.keycloak.models.jpa.entities",
+      "table": "USER_ENTITY",
+      "columns": [
+        {
+          "field": "createdTimestamp",
+          "name": "CREATED_TIMESTAMP"
+        },
+        {
+          "field": "email",
+          "name": "EMAIL"
+        },
+        {
+          "field": "emailConstraint",
+          "name": "EMAIL_CONSTRAINT"
+        },
+        {
+          "field": "emailVerified",
+          "name": "EMAIL_VERIFIED"
+        },
+        {
+          "field": "enabled",
+          "name": "ENABLED"
+        },
+        {
+          "field": "federationLink",
+          "name": "FEDERATION_LINK"
+        },
+        {
+          "field": "firstName",
+          "name": "FIRST_NAME"
+        },
+        {
+          "field": "id",
+          "name": "ID"
+        },
+        {
+          "field": "lastName",
+          "name": "LAST_NAME"
+        },
+        {
+          "field": "notBefore",
+          "name": "NOT_BEFORE"
+        },
+        {
+          "field": "realmId",
+          "name": "REALM_ID"
+        },
+        {
+          "field": "serviceAccountClientLink",
+          "name": "SERVICE_ACCOUNT_CLIENT_LINK"
+        },
+        {
+          "field": "username",
+          "name": "USERNAME"
+        }
+      ],
+      "queries": [
+        {
+          "name": "deleteUsersByRealm",
+          "jpql": "delete from UserEntity u where u.realmId = :realmId"
+        },
+        {
+          "name": "deleteUsersByRealmAndLink",
+          "jpql": "delete from UserEntity u where u.realmId = :realmId and u.federationLink=:link"
+        },
+        {
+          "name": "getRealmUserByEmail",
+          "jpql": "select u from UserEntity u where u.email = :email and u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserByFirstLastName",
+          "jpql": "select u from UserEntity u where u.firstName = :first and u.lastName = :last and u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserByLastName",
+          "jpql": "select u from UserEntity u where u.lastName = :lastName and u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserByServiceAccount",
+          "jpql": "select u from UserEntity u where u.serviceAccountClientLink = :clientInternalId and u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserByUsername",
+          "jpql": "select u from UserEntity u where u.username = :username and u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserCount",
+          "jpql": "select count(u) from UserEntity u where u.realmId = :realmId"
+        },
+        {
+          "name": "getRealmUserCountExcludeServiceAccount",
+          "jpql": "select count(u) from UserEntity u where u.realmId = :realmId and (u.serviceAccountClientLink is null)"
+        },
+        {
+          "name": "getRealmUsersByAttributeNameAndLongValue",
+          "jpql": "select u from UserEntity u join u.attributes attr where u.realmId = :realmId and attr.name = :name and attr.longValueHash = :longValueHash"
+        },
+        {
+          "name": "getRealmUsersByAttributeNameAndValue",
+          "jpql": "select u from UserEntity u join u.attributes attr where u.realmId = :realmId and attr.name = :name and attr.value = :value"
+        },
+        {
+          "name": "unlinkUsers",
+          "jpql": "update UserEntity u set u.federationLink = null where u.realmId = :realmId and u.federationLink=:link"
+        }
+      ]
+    }
+  ]
+}

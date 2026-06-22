@@ -1,0 +1,68 @@
+# golangci-lint v2 configuration.
+# Linting is mandatory: this must pass with zero errors before any commit/push.
+# `make lint` runs the same locally and in CI.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - funlen
+    - gocritic
+    - godot
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - nilerr
+    - predeclared
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+    - whitespace
+  settings:
+    funlen:
+      lines: 80
+      statements: 50
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+  exclusions:
+    generated: lax
+    rules:
+      # Test files relax body/length and security rules that do not apply.
+      - path: _test\.go
+        linters:
+          - funlen
+          - gosec
+          - gocritic
+          - unparam
+      # Generated golden corpus / codegen output.
+      - path: testdata/
+        linters:
+          - revive
+          - godot
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cozystack/keycloak-kms-proxy

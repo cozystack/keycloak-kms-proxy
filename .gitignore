@@ -1,0 +1,44 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/
+
+# Claude Code local state and agent worktrees (never commit these)
+.claude/worktrees/
+.claude/ralph-loop.local.md
+
+# Local secrets and rendered manifests for the dev stand (never commit;
+# ephemeral test creds). Templates in .tmpl files are committed.
+deploy/**/.secrets.local
+deploy/**/proxy.yaml
+deploy/**/keycloak.yaml
+deploy/**/.dekset.local
+/capture-keycloak-sql

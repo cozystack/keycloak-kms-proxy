@@ -1,0 +1,8 @@
+.git
+.claude
+.golangci.yml
+*.test
+coverage.*
+*.coverprofile
+profile.cov
+deploy/
