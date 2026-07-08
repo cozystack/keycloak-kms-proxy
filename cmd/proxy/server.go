@@ -128,12 +128,16 @@ func (s *server) addr() string {
 // relays — Accept blocks on a semaphore so the kernel queue absorbs the
 // backpressure instead of the process opening unbounded sessions.
 func (s *server) serve() error {
+	s.mu.Lock()
+	ln := s.listener
+	s.mu.Unlock()
+
 	var sem chan struct{}
 	if s.cfg.MaxConnections > 0 {
 		sem = make(chan struct{}, s.cfg.MaxConnections)
 	}
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
@@ -147,7 +151,22 @@ func (s *server) serve() error {
 		if s.cfg.HandshakeTimeout > 0 {
 			_ = conn.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 		}
-		s.wg.Add(1)
+		// Register the connection under the lock close() takes before
+		// waiting, so a conn accepted concurrently with close either
+		// increments the WaitGroup before close waits or is dropped.
+		s.mu.Lock()
+		closed := s.listener == nil
+		if !closed {
+			s.wg.Add(1)
+		}
+		s.mu.Unlock()
+		if closed {
+			_ = conn.Close()
+			if sem != nil {
+				<-sem
+			}
+			return nil
+		}
 		go func() {
 			defer s.wg.Done()
 			defer func() {
@@ -164,6 +183,7 @@ func (s *server) serve() error {
 func (s *server) close() error {
 	s.mu.Lock()
 	ln := s.listener
+	s.listener = nil
 	s.mu.Unlock()
 	if ln == nil {
 		return nil
