@@ -491,5 +491,95 @@ func TestVaultKMSAppRoleConcurrent(t *testing.T) {
 	}
 }
 
+func TestVaultKMSKubernetesRereadsToken(t *testing.T) {
+	t.Parallel()
+
+	const (
+		role   = "kc"
+		key    = "kms-proxy"
+		prefix = "vault:v1:"
+	)
+	jwtFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(jwtFile, []byte("jwt-v1"), 0o600); err != nil {
+		t.Fatalf("write jwt: %v", err)
+	}
+
+	var mu sync.Mutex
+	var seenJWTs []string
+	issued := 0
+	live := map[string]bool{} // tokens the transit endpoints currently accept
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Role string `json:"role"`
+			JWT  string `json:"jwt"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Role != role {
+			http.Error(w, `{"errors":["invalid role"]}`, http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		seenJWTs = append(seenJWTs, req.JWT)
+		issued++
+		tok := fmt.Sprintf("k8s-tok-%d", issued)
+		live[tok] = true
+		mu.Unlock()
+		writeJSON(w, map[string]any{"auth": map[string]any{"client_token": tok, "lease_duration": 3600}})
+	})
+	guard := func(w http.ResponseWriter, r *http.Request) bool {
+		mu.Lock()
+		ok := live[r.Header.Get("X-Vault-Token")]
+		mu.Unlock()
+		if !ok {
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+		}
+		return ok
+	}
+	mux.HandleFunc("/v1/transit/encrypt/"+key, func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r) {
+			return
+		}
+		var req struct {
+			Plaintext string `json:"plaintext"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, map[string]any{"data": map[string]string{"ciphertext": prefix + req.Plaintext}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	v, err := NewVaultKMS(VaultConfig{
+		Address: srv.URL, KeyName: key, KubernetesRole: role,
+		KubernetesJWTFile: jwtFile, HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+
+	// First Wrap logs in with jwt-v1.
+	if _, err := v.Wrap(context.Background(), []byte("dek")); err != nil {
+		t.Fatalf("first Wrap: %v", err)
+	}
+	// Revoke the issued token and rotate the on-disk JWT, as the kubelet would.
+	mu.Lock()
+	live = map[string]bool{}
+	mu.Unlock()
+	if err := os.WriteFile(jwtFile, []byte("jwt-v2"), 0o600); err != nil {
+		t.Fatalf("rotate jwt: %v", err)
+	}
+	// The cached token now 403s; the re-login must re-read the rotated JWT.
+	if _, err := v.Wrap(context.Background(), []byte("dek")); err != nil {
+		t.Fatalf("second Wrap should re-login with the rotated token: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenJWTs) < 2 || seenJWTs[0] != "jwt-v1" || seenJWTs[len(seenJWTs)-1] != "jwt-v2" {
+		t.Fatalf("expected logins to re-read jwt-v1 then jwt-v2, saw %v", seenJWTs)
+	}
+}
+
 // VaultKMS must satisfy the KMS interface.
 var _ KMS = (*VaultKMS)(nil)
