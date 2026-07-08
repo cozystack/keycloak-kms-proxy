@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -313,9 +315,11 @@ func TestVaultKMSAuthModeValidation(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]VaultConfig{
-		"token and approle":         {Address: "http://v", KeyName: "k", Token: "t", RoleID: "r", SecretID: "s"},
-		"approle missing secret":    {Address: "http://v", KeyName: "k", RoleID: "r"},
-		"neither token nor approle": {Address: "http://v", KeyName: "k"},
+		"token and approle":      {Address: "http://v", KeyName: "k", Token: "t", RoleID: "r", SecretID: "s"},
+		"token and kubernetes":   {Address: "http://v", KeyName: "k", Token: "t", KubernetesRole: "r"},
+		"approle and kubernetes": {Address: "http://v", KeyName: "k", RoleID: "r", SecretID: "s", KubernetesRole: "r"},
+		"approle missing secret": {Address: "http://v", KeyName: "k", RoleID: "r"},
+		"no auth mode":           {Address: "http://v", KeyName: "k"},
 	}
 	for name, cfg := range cases {
 		if _, err := NewVaultKMS(cfg); err == nil {
@@ -324,23 +328,116 @@ func TestVaultKMSAuthModeValidation(t *testing.T) {
 	}
 }
 
+func TestVaultKMSKubernetesRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const (
+		role   = "keycloak-proxy"
+		jwt    = "sa-jwt-token"
+		key    = "kms-proxy"
+		prefix = "vault:v1:"
+		issued = "k8s-issued-token"
+	)
+	// Write the JWT with a trailing newline to exercise the TrimSpace.
+	jwtFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(jwtFile, []byte(jwt+"\n"), 0o600); err != nil {
+		t.Fatalf("write jwt: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Role string `json:"role"`
+			JWT  string `json:"jwt"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Role != role || req.JWT != jwt {
+			http.Error(w, `{"errors":["invalid role or jwt"]}`, http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"auth": map[string]any{"client_token": issued, "lease_duration": 3600}})
+	})
+	guard := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Vault-Token") != issued {
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+			return false
+		}
+		return true
+	}
+	mux.HandleFunc("/v1/transit/encrypt/"+key, func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r) {
+			return
+		}
+		var req struct {
+			Plaintext string `json:"plaintext"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, map[string]any{"data": map[string]string{"ciphertext": prefix + req.Plaintext}})
+	})
+	mux.HandleFunc("/v1/transit/decrypt/"+key, func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r) {
+			return
+		}
+		var req struct {
+			Ciphertext string `json:"ciphertext"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, map[string]any{"data": map[string]string{"plaintext": strings.TrimPrefix(req.Ciphertext, prefix)}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	v, err := NewVaultKMS(VaultConfig{
+		Address:           srv.URL,
+		KeyName:           key,
+		KubernetesRole:    role,
+		KubernetesJWTFile: jwtFile,
+		HTTPClient:        srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+	wrapped, err := v.Wrap(context.Background(), []byte("dek"))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	got, err := v.Unwrap(context.Background(), wrapped)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if string(got) != "dek" {
+		t.Fatalf("round-trip mismatch: %q", got)
+	}
+}
+
+func TestVaultKMSKubernetesMissingJWT(t *testing.T) {
+	t.Parallel()
+
+	v, err := NewVaultKMS(VaultConfig{
+		Address:           "http://vault.invalid",
+		KeyName:           "kms-proxy",
+		KubernetesRole:    "keycloak-proxy",
+		KubernetesJWTFile: filepath.Join(t.TempDir(), "does-not-exist"),
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+	if _, err := v.Wrap(context.Background(), []byte("dek")); err == nil {
+		t.Fatal("Wrap succeeded with a missing ServiceAccount token file")
+	}
+}
+
 func TestVaultAuthProactiveRenewFallback(t *testing.T) {
 	t.Parallel()
 
-	// A login endpoint that always fails, to simulate a transient Vault error
-	// during a proactive re-login.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, `{"errors":["service unavailable"]}`, http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(srv.Close)
-
+	// login always fails, simulating a transient Vault error during a
+	// proactive re-login while the cached token is still valid.
 	a := &vaultAuth{
-		client:   srv.Client(),
-		loginURL: srv.URL + "/v1/auth/approle/login",
-		roleID:   "r",
-		secretID: "s",
-		token:    "still-valid",
-		expiry:   time.Now().Add(renewSkew / 2), // inside renewSkew, but not expired.
+		loginFn: func(context.Context) (string, time.Time, error) {
+			return "", time.Time{}, fmt.Errorf("transient vault error")
+		},
+		token:  "still-valid",
+		expiry: time.Now().Add(renewSkew / 2), // inside renewSkew, but not expired.
 	}
 	got, err := a.currentToken(context.Background())
 	if err != nil {
@@ -356,16 +453,10 @@ func TestVaultAuthReauthNoStaleToken(t *testing.T) {
 
 	// After a hard 403 the token is cleared (reauth); a failing re-login must
 	// surface the error rather than returning a stale token.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
-	}))
-	t.Cleanup(srv.Close)
-
 	a := &vaultAuth{
-		client:   srv.Client(),
-		loginURL: srv.URL + "/v1/auth/approle/login",
-		roleID:   "r",
-		secretID: "s",
+		loginFn: func(context.Context) (string, time.Time, error) {
+			return "", time.Time{}, fmt.Errorf("login denied")
+		},
 	}
 	if _, err := a.currentToken(context.Background()); err == nil {
 		t.Fatal("currentToken should fail when login fails and no token is cached")

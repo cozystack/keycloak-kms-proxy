@@ -59,6 +59,14 @@ type ProxyConfig struct {
 	VaultAppRoleMount string
 	VaultRoleID       string
 	VaultSecretID     string
+	// VaultKubernetesRole selects Vault Kubernetes authentication (preferred in
+	// production): the proxy logs in with its projected ServiceAccount token,
+	// which the kubelet rotates, so no long-lived credential is stored.
+	// VaultKubernetesMount defaults to "kubernetes"; VaultKubernetesJWTFile
+	// defaults to the standard in-pod ServiceAccount token path.
+	VaultKubernetesRole    string
+	VaultKubernetesMount   string
+	VaultKubernetesJWTFile string
 	// TLSCertFile/TLSKeyFile, when both set, make the proxy terminate TLS on
 	// the Keycloak-facing listener. Both must be set or both
 	// must be empty.
@@ -108,6 +116,9 @@ const (
 	envVaultAppRoleMount = "KKP_VAULT_APPROLE_MOUNT"
 	envVaultRoleID       = "KKP_VAULT_ROLE_ID"
 	envVaultSecretID     = "KKP_VAULT_SECRET_ID" //nolint:gosec // env var name, not a credential
+	envVaultK8sRole      = "KKP_VAULT_KUBERNETES_ROLE"
+	envVaultK8sMount     = "KKP_VAULT_KUBERNETES_MOUNT"
+	envVaultK8sJWTFile   = "KKP_VAULT_KUBERNETES_JWT_FILE" //nolint:gosec // env var name, not a credential
 	envTLSCertFile       = "KKP_TLS_CERT_FILE"
 	envTLSKeyFile        = "KKP_TLS_KEY_FILE"
 	envMetricsAddr       = "KKP_METRICS_ADDR"
@@ -150,29 +161,32 @@ func LoadProxyConfig() (*ProxyConfig, error) {
 		return nil, err
 	}
 	cfg := &ProxyConfig{
-		ListenAddr:        os.Getenv(envListenAddr),
-		BackendAddr:       os.Getenv(envBackendAddr),
-		KEK:               kek,
-		UpstreamUser:      os.Getenv(envUpstreamUser),
-		UpstreamPassword:  os.Getenv(envUpstreamPassword),
-		BackendUser:       os.Getenv(envBackendUser),
-		BackendPassword:   os.Getenv(envBackendPassword),
-		Fields:            fields,
-		Lenient:           os.Getenv(envLenient) == "true",
-		DEKSetFile:        os.Getenv(envDEKSetFile),
-		VaultAddr:         os.Getenv(envVaultAddr),
-		VaultToken:        os.Getenv(envVaultToken),
-		VaultKeyName:      os.Getenv(envVaultKeyName),
-		VaultMount:        os.Getenv(envVaultMount),
-		VaultAppRoleMount: os.Getenv(envVaultAppRoleMount),
-		VaultRoleID:       os.Getenv(envVaultRoleID),
-		VaultSecretID:     os.Getenv(envVaultSecretID),
-		TLSCertFile:       os.Getenv(envTLSCertFile),
-		TLSKeyFile:        os.Getenv(envTLSKeyFile),
-		MetricsAddr:       os.Getenv(envMetricsAddr),
-		HealthAddr:        os.Getenv(envHealthAddr),
-		BackendCAFile:     os.Getenv(envBackendCAFile),
-		BackendServerName: os.Getenv(envBackendServerName),
+		ListenAddr:             os.Getenv(envListenAddr),
+		BackendAddr:            os.Getenv(envBackendAddr),
+		KEK:                    kek,
+		UpstreamUser:           os.Getenv(envUpstreamUser),
+		UpstreamPassword:       os.Getenv(envUpstreamPassword),
+		BackendUser:            os.Getenv(envBackendUser),
+		BackendPassword:        os.Getenv(envBackendPassword),
+		Fields:                 fields,
+		Lenient:                os.Getenv(envLenient) == "true",
+		DEKSetFile:             os.Getenv(envDEKSetFile),
+		VaultAddr:              os.Getenv(envVaultAddr),
+		VaultToken:             os.Getenv(envVaultToken),
+		VaultKeyName:           os.Getenv(envVaultKeyName),
+		VaultMount:             os.Getenv(envVaultMount),
+		VaultAppRoleMount:      os.Getenv(envVaultAppRoleMount),
+		VaultRoleID:            os.Getenv(envVaultRoleID),
+		VaultSecretID:          os.Getenv(envVaultSecretID),
+		VaultKubernetesRole:    os.Getenv(envVaultK8sRole),
+		VaultKubernetesMount:   os.Getenv(envVaultK8sMount),
+		VaultKubernetesJWTFile: os.Getenv(envVaultK8sJWTFile),
+		TLSCertFile:            os.Getenv(envTLSCertFile),
+		TLSKeyFile:             os.Getenv(envTLSKeyFile),
+		MetricsAddr:            os.Getenv(envMetricsAddr),
+		HealthAddr:             os.Getenv(envHealthAddr),
+		BackendCAFile:          os.Getenv(envBackendCAFile),
+		BackendServerName:      os.Getenv(envBackendServerName),
 	}
 	if v := os.Getenv(envMaxConnections); v != "" {
 		n, perr := strconv.Atoi(v)
@@ -246,22 +260,37 @@ func (c *ProxyConfig) validateKMS() error {
 }
 
 // validateVaultAuth checks the Vault Transit settings: a KEK name plus exactly
-// one auth mode — a static token, or an AppRole (both role id and secret id).
+// one auth mode — a static token, an AppRole (both role id and secret id), or
+// Kubernetes (a role, logging in with the pod ServiceAccount token).
 func (c *ProxyConfig) validateVaultAuth() error {
 	if c.VaultKeyName == "" {
 		return fmt.Errorf("config: %s requires %s", envVaultAddr, envVaultKeyName)
 	}
 	hasToken := c.VaultToken != ""
 	hasAppRole := c.VaultRoleID != "" || c.VaultSecretID != ""
+	hasK8s := c.VaultKubernetesRole != ""
 	switch {
-	case hasToken && hasAppRole:
-		return fmt.Errorf("config: set %s or AppRole (%s + %s), not both", envVaultToken, envVaultRoleID, envVaultSecretID)
+	case boolCount(hasToken, hasAppRole, hasK8s) > 1:
+		return fmt.Errorf("config: configure exactly one Vault auth mode — %s, AppRole (%s), or Kubernetes (%s)",
+			envVaultToken, envVaultRoleID, envVaultK8sRole)
 	case hasAppRole && (c.VaultRoleID == "" || c.VaultSecretID == ""):
 		return fmt.Errorf("config: AppRole auth requires both %s and %s", envVaultRoleID, envVaultSecretID)
-	case !hasToken && !hasAppRole:
-		return fmt.Errorf("config: %s requires %s or AppRole (%s + %s)", envVaultAddr, envVaultToken, envVaultRoleID, envVaultSecretID)
+	case !hasToken && !hasAppRole && !hasK8s:
+		return fmt.Errorf("config: %s requires one of %s, AppRole (%s), or Kubernetes (%s)",
+			envVaultAddr, envVaultToken, envVaultRoleID, envVaultK8sRole)
 	}
 	return nil
+}
+
+// boolCount counts how many of the given conditions are true.
+func boolCount(bs ...bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
 }
 
 // selectFields builds the FieldSet matching the KKP_FIELDS env value.

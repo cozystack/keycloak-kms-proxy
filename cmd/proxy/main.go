@@ -184,6 +184,10 @@ func buildKMS(cfg *config.ProxyConfig) (kms.KMS, error) {
 			AppRoleMount: cfg.VaultAppRoleMount,
 			RoleID:       cfg.VaultRoleID,
 			SecretID:     cfg.VaultSecretID,
+
+			KubernetesRole:    cfg.VaultKubernetesRole,
+			KubernetesMount:   cfg.VaultKubernetesMount,
+			KubernetesJWTFile: cfg.VaultKubernetesJWTFile,
 		})
 	}
 	return kms.NewStaticKMS(cfg.KEK)

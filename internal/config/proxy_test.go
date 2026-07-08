@@ -72,12 +72,28 @@ func TestProxyConfigValidateVaultAppRole(t *testing.T) {
 	}
 }
 
+func TestProxyConfigValidateVaultKubernetes(t *testing.T) {
+	t.Parallel()
+
+	c := vaultProxyConfig()
+	c.VaultKubernetesRole = "keycloak-proxy"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected a valid Kubernetes-auth config: %v", err)
+	}
+}
+
 func TestProxyConfigValidateVaultAuthMisconfig(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]func(*ProxyConfig){
 		"token and approle": func(c *ProxyConfig) {
 			c.VaultToken, c.VaultRoleID, c.VaultSecretID = "t", "r", "s"
+		},
+		"token and kubernetes": func(c *ProxyConfig) {
+			c.VaultToken, c.VaultKubernetesRole = "t", "r"
+		},
+		"approle and kubernetes": func(c *ProxyConfig) {
+			c.VaultRoleID, c.VaultSecretID, c.VaultKubernetesRole = "r", "s", "r"
 		},
 		"approle missing secret id": func(c *ProxyConfig) { c.VaultRoleID = "r" },
 		"no auth at all":            func(c *ProxyConfig) {},

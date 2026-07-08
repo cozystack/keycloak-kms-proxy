@@ -10,14 +10,20 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	defaultTransitMount = "transit"
-	defaultAppRoleMount = "approle"
-	defaultVaultTimeout = 10 * time.Second
+	defaultTransitMount    = "transit"
+	defaultAppRoleMount    = "approle"
+	defaultKubernetesMount = "kubernetes"
+	// defaultKubernetesJWTFile is the projected ServiceAccount token mounted
+	// into every pod; Vault Kubernetes auth logs in with it.
+	defaultKubernetesJWTFile = "/var/run/secrets/kubernetes.io/serviceaccount/token" //nolint:gosec // well-known path, not a credential
+	defaultVaultTimeout      = 10 * time.Second
 	// renewSkew re-authenticates this long before the cached token's TTL
 	// expires, so an in-flight Wrap/Unwrap never races the expiry.
 	renewSkew = 30 * time.Second
@@ -44,6 +50,15 @@ type VaultConfig struct {
 	// re-authenticates on demand when the issued token expires.
 	RoleID   string
 	SecretID string
+
+	// KubernetesRole selects Vault Kubernetes authentication: the KMS logs in
+	// with the pod's projected ServiceAccount token. This is the preferred
+	// production method — the token is short-lived and rotated by the kubelet,
+	// so no long-lived credential is stored. KubernetesMount defaults to
+	// "kubernetes" and KubernetesJWTFile to the standard in-pod token path.
+	KubernetesRole    string
+	KubernetesMount   string
+	KubernetesJWTFile string
 }
 
 // VaultKMS wraps and unwraps the DEK using Vault Transit's encrypt/decrypt
@@ -173,56 +188,61 @@ func (v *VaultKMS) do(ctx context.Context, url string, body []byte, token string
 	return resp.StatusCode, respBody, nil
 }
 
+// tokenLogin authenticates to Vault and returns a fresh token and its expiry
+// (zero expiry meaning the token does not expire).
+type tokenLogin func(ctx context.Context) (string, time.Time, error)
+
 // vaultAuth supplies the X-Vault-Token for Transit calls. It is either a fixed
-// static token or an AppRole login that mints (and, on demand, re-mints) a
-// short-lived token.
+// static token or a login strategy (AppRole / Kubernetes) that mints (and, on
+// demand, re-mints) a short-lived token.
 type vaultAuth struct {
-	client   *http.Client
-	static   string // set for static-token auth; empty for AppRole.
-	loginURL string // set for AppRole auth.
-	roleID   string
-	secretID string
+	static  string     // set for static-token auth; loginFn is nil.
+	loginFn tokenLogin // set for AppRole / Kubernetes auth.
 
 	mu     sync.Mutex // guards token/expiry; never held across the login I/O.
 	token  string
 	expiry time.Time // zero once logged in => the token does not expire.
 
-	loginMu sync.Mutex // serializes AppRole logins.
+	loginMu sync.Mutex // serializes logins.
 }
 
-// newVaultAuth builds the auth strategy from cfg, enforcing exactly one mode.
+// newVaultAuth builds the auth strategy from cfg, enforcing exactly one mode:
+// a static token, AppRole, or Kubernetes.
 func newVaultAuth(cfg VaultConfig, client *http.Client) (*vaultAuth, error) {
-	approle := cfg.RoleID != "" || cfg.SecretID != ""
+	hasToken := cfg.Token != ""
+	hasAppRole := cfg.RoleID != "" || cfg.SecretID != ""
+	hasK8s := cfg.KubernetesRole != ""
+
 	switch {
-	case approle && cfg.Token != "":
-		return nil, errors.New("kms: set either a static token or AppRole credentials, not both")
-	case approle && (cfg.RoleID == "" || cfg.SecretID == ""):
+	case btoi(hasToken)+btoi(hasAppRole)+btoi(hasK8s) > 1:
+		return nil, errors.New("kms: configure exactly one Vault auth mode (token, AppRole, or Kubernetes)")
+	case hasAppRole && (cfg.RoleID == "" || cfg.SecretID == ""):
 		return nil, errors.New("kms: AppRole auth requires both a role id and a secret id")
-	case !approle && cfg.Token == "":
-		return nil, errors.New("kms: a vault token or AppRole credentials are required")
+	case !hasToken && !hasAppRole && !hasK8s:
+		return nil, errors.New("kms: a vault token, AppRole, or Kubernetes auth is required")
 	}
 
-	if !approle {
-		return &vaultAuth{client: client, static: cfg.Token}, nil
+	switch {
+	case hasAppRole:
+		mount := orDefault(cfg.AppRoleMount, defaultAppRoleMount)
+		url := fmt.Sprintf("%s/v1/auth/%s/login", cfg.Address, mount)
+		return &vaultAuth{loginFn: approleLogin(client, url, cfg.RoleID, cfg.SecretID)}, nil
+	case hasK8s:
+		mount := orDefault(cfg.KubernetesMount, defaultKubernetesMount)
+		jwtFile := orDefault(cfg.KubernetesJWTFile, defaultKubernetesJWTFile)
+		url := fmt.Sprintf("%s/v1/auth/%s/login", cfg.Address, mount)
+		return &vaultAuth{loginFn: kubernetesLogin(client, url, cfg.KubernetesRole, jwtFile)}, nil
+	default:
+		return &vaultAuth{static: cfg.Token}, nil
 	}
-	mount := cfg.AppRoleMount
-	if mount == "" {
-		mount = defaultAppRoleMount
-	}
-	return &vaultAuth{
-		client:   client,
-		loginURL: fmt.Sprintf("%s/v1/auth/%s/login", cfg.Address, mount),
-		roleID:   cfg.RoleID,
-		secretID: cfg.SecretID,
-	}, nil
 }
 
-// currentToken returns a valid Vault token, logging in via AppRole when the
-// cached token is missing or within renewSkew of expiry. The login network
-// call is serialized by loginMu and never holds mu, so a caller whose token is
-// still valid is never blocked by an in-flight login.
+// currentToken returns a valid Vault token, logging in when the cached token is
+// missing or within renewSkew of expiry. The login network call is serialized
+// by loginMu and never holds mu, so a caller whose token is still valid is
+// never blocked by an in-flight login.
 func (a *vaultAuth) currentToken(ctx context.Context) (string, error) {
-	if a.loginURL == "" {
+	if a.loginFn == nil {
 		return a.static, nil
 	}
 	if tok, ok := a.freshToken(); ok {
@@ -242,7 +262,7 @@ func (a *vaultAuth) currentToken(ctx context.Context) (string, error) {
 	if tok, ok := a.freshToken(); ok {
 		return tok, nil
 	}
-	tok, expiry, err := a.login(ctx)
+	tok, expiry, err := a.loginFn(ctx)
 	if err != nil {
 		// A proactive re-login (token still valid but within renewSkew) may
 		// fail transiently; fall back to the still-usable token rather than
@@ -291,7 +311,7 @@ func (a *vaultAuth) usableToken() (string, bool) {
 // token would force a needless extra login. It reports whether re-auth is
 // possible (false for static tokens).
 func (a *vaultAuth) reauth(stale string) bool {
-	if a.loginURL == "" {
+	if a.loginFn == nil {
 		return false
 	}
 	a.mu.Lock()
@@ -303,32 +323,69 @@ func (a *vaultAuth) reauth(stale string) bool {
 	return true
 }
 
-// login performs an AppRole login and returns the issued token and its expiry
-// (zero expiry meaning the token does not expire). It does not mutate a, so it
-// runs safely without holding mu during the network call.
-func (a *vaultAuth) login(ctx context.Context) (string, time.Time, error) {
-	reqBody, err := json.Marshal(map[string]string{"role_id": a.roleID, "secret_id": a.secretID})
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("kms: marshal approle login: %w", err)
+// btoi returns 1 for true and 0 for false, to count how many auth modes are set.
+func btoi(b bool) int {
+	if b {
+		return 1
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.loginURL, bytes.NewReader(reqBody))
+	return 0
+}
+
+// orDefault returns v when non-empty, otherwise def.
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// approleLogin returns a tokenLogin that authenticates with an AppRole
+// role id / secret id.
+func approleLogin(client *http.Client, url, roleID, secretID string) tokenLogin {
+	return func(ctx context.Context) (string, time.Time, error) {
+		return vaultLogin(ctx, client, url, map[string]string{"role_id": roleID, "secret_id": secretID})
+	}
+}
+
+// kubernetesLogin returns a tokenLogin that authenticates with the pod's
+// projected ServiceAccount token. The token is re-read from disk on every
+// login, so the kubelet's rotation is picked up without a restart.
+func kubernetesLogin(client *http.Client, url, role, jwtFile string) tokenLogin {
+	return func(ctx context.Context) (string, time.Time, error) {
+		jwt, err := os.ReadFile(jwtFile) //nolint:gosec // path is operator-controlled config.
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("kms: read serviceaccount token: %w", err)
+		}
+		return vaultLogin(ctx, client, url, map[string]string{"role": role, "jwt": strings.TrimSpace(string(jwt))})
+	}
+}
+
+// vaultLogin posts an auth login request and returns the issued token and its
+// expiry (zero expiry meaning the token does not expire). It touches no shared
+// state, so it runs safely without holding a lock during the network call.
+func vaultLogin(ctx context.Context, client *http.Client, url string, params map[string]string) (string, time.Time, error) {
+	reqBody, err := json.Marshal(params)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("kms: build approle login: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: marshal vault login: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("kms: build vault login: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := a.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("kms: approle login request: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: vault login request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("kms: read approle login response: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: read vault login response: %w", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", time.Time{}, fmt.Errorf("kms: approle login returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return "", time.Time{}, fmt.Errorf("kms: vault login returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 
 	var lr struct {
@@ -338,10 +395,10 @@ func (a *vaultAuth) login(ctx context.Context) (string, time.Time, error) {
 		} `json:"auth"`
 	}
 	if err := json.Unmarshal(body, &lr); err != nil {
-		return "", time.Time{}, fmt.Errorf("kms: decode approle login response: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: decode vault login response: %w", err)
 	}
 	if lr.Auth.ClientToken == "" {
-		return "", time.Time{}, errors.New("kms: approle login returned an empty client token")
+		return "", time.Time{}, errors.New("kms: vault login returned an empty client token")
 	}
 
 	var expiry time.Time

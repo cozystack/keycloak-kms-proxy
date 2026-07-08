@@ -40,17 +40,25 @@ Keycloak ── kkp-proxy Service ──┬── replica 1 ──┐
 Required for this shape:
 
 - `replicas: 2` on the proxy Deployment.
-- `KKP_VAULT_ADDR`, `KKP_VAULT_KEY_NAME`, `KKP_VAULT_MOUNT`, and Vault
-  auth — either `KKP_VAULT_TOKEN` (a static token) or AppRole
-  (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via
-  `KKP_VAULT_APPROLE_MOUNT`, default `approle`). With AppRole the proxy
-  logs in itself and re-authenticates on demand as the token expires, so
-  no long-lived token sits in a Secret. Provision the AppRole with a
-  reusable `secret_id` (avoid `secret_id_num_uses=1` and keep
-  `secret_id_ttl` no shorter than the token TTL) — the proxy reuses the
-  secret id for every on-demand re-login, so `KKP_VAULT_ADDR` MUST be
-  HTTPS. Keep `token_ttl` above the proxy's 30s renew skew. `KKP_KEK`
-  MUST be unset.
+- `KKP_VAULT_ADDR`, `KKP_VAULT_KEY_NAME`, `KKP_VAULT_MOUNT`, and exactly
+  one Vault auth mode (`KKP_KEK` MUST be unset):
+  - **Kubernetes** (`KKP_VAULT_KUBERNETES_ROLE`; mount via
+    `KKP_VAULT_KUBERNETES_MOUNT`, default `kubernetes`; token via
+    `KKP_VAULT_KUBERNETES_JWT_FILE`, default the in-pod path) —
+    **recommended**. The proxy logs in with its projected ServiceAccount
+    token, which the kubelet rotates, so no long-lived credential is
+    stored. Bind the Vault role to the proxy's ServiceAccount + namespace.
+  - **AppRole** (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via
+    `KKP_VAULT_APPROLE_MOUNT`, default `approle`). Provision a reusable
+    `secret_id` (avoid `secret_id_num_uses=1`, keep `secret_id_ttl` no
+    shorter than the token TTL) — the proxy reuses it for every on-demand
+    re-login.
+  - **Static token** (`KKP_VAULT_TOKEN`) — simplest, a long-lived token in
+    a Secret.
+
+  For the login methods point `KKP_VAULT_ADDR` at HTTPS (credentials
+  travel on every login) and keep `token_ttl` above the proxy's 30s renew
+  skew.
 - `KKP_BACKEND_CA_FILE` + `KKP_BACKEND_SERVER_NAME` pointing at the
   CNPG `*-ca` Secret + the read-write Service DNS.
 - `KKP_TLS_CERT_FILE`/`KKP_TLS_KEY_FILE` for the listener side
@@ -82,7 +90,7 @@ ciphertext.
 | `kc-db-ca` (CNPG-managed name varies) | CNPG operator | CA bundle for `KKP_BACKEND_CA_FILE` so the downstream TLS leg is verified |
 | `kc-db-app` (CNPG default) | CNPG operator | `KKP_BACKEND_PASSWORD` (the credential the proxy uses to authenticate to CNPG) |
 | `keycloak-creds` | operator | Keycloak's own admin password + `KC_DB_PASSWORD` (must match `KKP_UPSTREAM_PASSWORD` because the proxy verifies it on the upstream leg) |
-| Vault auth | platform | AppRole `role_id`/`secret_id` in a Secret (`KKP_VAULT_ROLE_ID`/`KKP_VAULT_SECRET_ID`, recommended — short-lived tokens minted on demand) or a static Vault token (`KKP_VAULT_TOKEN`) |
+| Vault auth | platform | Kubernetes auth bound to the proxy ServiceAccount (recommended — no stored credential), AppRole `role_id`/`secret_id` in a Secret, or a static Vault token (`KKP_VAULT_TOKEN`) |
 
 ## Required network policies
 
@@ -152,8 +160,9 @@ The list, with a brief intent for each:
 | `KKP_KEK` | Static KMS — dev only |
 | `KKP_DEKSET_FILE` | Path to the wrapped DEK set (required so DEK survives restarts) |
 | `KKP_VAULT_ADDR` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS — production default |
-| `KKP_VAULT_TOKEN` | Static Vault token auth (mutually exclusive with AppRole) |
+| `KKP_VAULT_KUBERNETES_ROLE` / `KKP_VAULT_KUBERNETES_MOUNT` / `KKP_VAULT_KUBERNETES_JWT_FILE` | Vault Kubernetes auth (recommended) — login with the pod ServiceAccount token (mount default `kubernetes`) |
 | `KKP_VAULT_ROLE_ID` / `KKP_VAULT_SECRET_ID` / `KKP_VAULT_APPROLE_MOUNT` | Vault AppRole auth — the proxy logs in and re-authenticates on demand (mount default `approle`) |
+| `KKP_VAULT_TOKEN` | Static Vault token auth (exactly one auth mode) |
 | `KKP_TLS_CERT_FILE` / `KKP_TLS_KEY_FILE` | Listener TLS termination |
 | `KKP_BACKEND_CA_FILE` / `KKP_BACKEND_SERVER_NAME` | TLS re-origination to CNPG |
 | `KKP_HEALTH_ADDR` | `/healthz` + `/readyz` endpoint (k8s probes) |
