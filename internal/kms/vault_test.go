@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cozystack/keycloak-kms-proxy/internal/crypto"
@@ -149,6 +151,175 @@ func TestVaultKMSEnvelopeRoundTrip(t *testing.T) {
 	}
 	if string(got) != "alice@example.com" {
 		t.Fatalf("round-trip: got %q", got)
+	}
+}
+
+const (
+	approleRoleID   = "role-abc"
+	approleSecretID = "secret-xyz"
+)
+
+// fakeVaultAppRole is an in-memory Vault Transit stand-in that requires AppRole
+// login. Tokens issued before acceptFromLogin are treated as already expired,
+// so encrypt/decrypt reject them with 403 — this drives the re-auth path. The
+// returned func reports how many logins happened.
+func fakeVaultAppRole(t *testing.T, acceptFromLogin int) (*httptest.Server, func() int) {
+	t.Helper()
+
+	const (
+		key    = "kms-proxy"
+		prefix = "vault:v1:"
+	)
+	var mu sync.Mutex
+	logins := 0
+	valid := map[string]bool{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/auth/approle/login", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			RoleID   string `json:"role_id"`
+			SecretID string `json:"secret_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.RoleID != approleRoleID || req.SecretID != approleSecretID {
+			http.Error(w, `{"errors":["invalid role or secret id"]}`, http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		logins++
+		tok := fmt.Sprintf("approle-tok-%d", logins)
+		if logins >= acceptFromLogin {
+			valid[tok] = true
+		}
+		mu.Unlock()
+		writeJSON(w, map[string]any{"auth": map[string]any{
+			"client_token": tok, "lease_duration": 3600, "renewable": true,
+		}})
+	})
+	authOK := func(w http.ResponseWriter, r *http.Request) bool {
+		mu.Lock()
+		ok := valid[r.Header.Get("X-Vault-Token")]
+		mu.Unlock()
+		if !ok {
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+		}
+		return ok
+	}
+	mux.HandleFunc("/v1/transit/encrypt/"+key, func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r) {
+			return
+		}
+		var req struct {
+			Plaintext string `json:"plaintext"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, map[string]any{"data": map[string]string{"ciphertext": prefix + req.Plaintext}})
+	})
+	mux.HandleFunc("/v1/transit/decrypt/"+key, func(w http.ResponseWriter, r *http.Request) {
+		if !authOK(w, r) {
+			return
+		}
+		var req struct {
+			Ciphertext string `json:"ciphertext"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, map[string]any{"data": map[string]string{"plaintext": strings.TrimPrefix(req.Ciphertext, prefix)}})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return logins
+	}
+}
+
+func newAppRoleVault(t *testing.T, srv *httptest.Server) *VaultKMS {
+	t.Helper()
+
+	v, err := NewVaultKMS(VaultConfig{
+		Address:    srv.URL,
+		KeyName:    "kms-proxy",
+		RoleID:     approleRoleID,
+		SecretID:   approleSecretID,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+	return v
+}
+
+func TestVaultKMSAppRoleRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	srv, logins := fakeVaultAppRole(t, 1)
+	v := newAppRoleVault(t, srv)
+
+	wrapped, err := v.Wrap(context.Background(), []byte("dek"))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	got, err := v.Unwrap(context.Background(), wrapped)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if string(got) != "dek" {
+		t.Fatalf("round-trip mismatch: %q", got)
+	}
+	if n := logins(); n != 1 {
+		t.Fatalf("expected exactly one AppRole login (token cached), got %d", n)
+	}
+}
+
+func TestVaultKMSAppRoleReauthOn403(t *testing.T) {
+	t.Parallel()
+
+	// The first issued token is treated as expired, so the first encrypt gets
+	// 403; the KMS must drop it, log in again, and retry successfully.
+	srv, logins := fakeVaultAppRole(t, 2)
+	v := newAppRoleVault(t, srv)
+
+	if _, err := v.Wrap(context.Background(), []byte("dek")); err != nil {
+		t.Fatalf("Wrap should recover via re-auth: %v", err)
+	}
+	if n := logins(); n != 2 {
+		t.Fatalf("expected a re-auth login, got %d logins", n)
+	}
+}
+
+func TestVaultKMSAppRoleBadCredentials(t *testing.T) {
+	t.Parallel()
+
+	srv, _ := fakeVaultAppRole(t, 1)
+	v, err := NewVaultKMS(VaultConfig{
+		Address:    srv.URL,
+		KeyName:    "kms-proxy",
+		RoleID:     approleRoleID,
+		SecretID:   "wrong-secret",
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+	if _, err := v.Wrap(context.Background(), []byte("dek")); err == nil {
+		t.Fatal("Wrap succeeded with bad AppRole credentials")
+	}
+}
+
+func TestVaultKMSAuthModeValidation(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]VaultConfig{
+		"token and approle":         {Address: "http://v", KeyName: "k", Token: "t", RoleID: "r", SecretID: "s"},
+		"approle missing secret":    {Address: "http://v", KeyName: "k", RoleID: "r"},
+		"neither token nor approle": {Address: "http://v", KeyName: "k"},
+	}
+	for name, cfg := range cases {
+		if _, err := NewVaultKMS(cfg); err == nil {
+			t.Errorf("%s: NewVaultKMS accepted an invalid auth config", name)
+		}
 	}
 }
 
