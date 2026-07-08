@@ -52,6 +52,13 @@ type ProxyConfig struct {
 	VaultToken   string
 	VaultKeyName string
 	VaultMount   string
+	// VaultRoleID/VaultSecretID select AppRole authentication against the
+	// Vault Transit KMS instead of a static VaultToken. When set, the proxy
+	// logs in via AppRole and re-authenticates on demand as the token expires.
+	// VaultAppRoleMount is the AppRole auth mount path; defaults to "approle".
+	VaultAppRoleMount string
+	VaultRoleID       string
+	VaultSecretID     string
 	// TLSCertFile/TLSKeyFile, when both set, make the proxy terminate TLS on
 	// the Keycloak-facing listener. Both must be set or both
 	// must be empty.
@@ -98,6 +105,9 @@ const (
 	envVaultToken        = "KKP_VAULT_TOKEN" //nolint:gosec // env var name, not a credential
 	envVaultKeyName      = "KKP_VAULT_KEY_NAME"
 	envVaultMount        = "KKP_VAULT_MOUNT"
+	envVaultAppRoleMount = "KKP_VAULT_APPROLE_MOUNT"
+	envVaultRoleID       = "KKP_VAULT_ROLE_ID"
+	envVaultSecretID     = "KKP_VAULT_SECRET_ID" //nolint:gosec // env var name, not a credential
 	envTLSCertFile       = "KKP_TLS_CERT_FILE"
 	envTLSKeyFile        = "KKP_TLS_KEY_FILE"
 	envMetricsAddr       = "KKP_METRICS_ADDR"
@@ -154,6 +164,9 @@ func LoadProxyConfig() (*ProxyConfig, error) {
 		VaultToken:        os.Getenv(envVaultToken),
 		VaultKeyName:      os.Getenv(envVaultKeyName),
 		VaultMount:        os.Getenv(envVaultMount),
+		VaultAppRoleMount: os.Getenv(envVaultAppRoleMount),
+		VaultRoleID:       os.Getenv(envVaultRoleID),
+		VaultSecretID:     os.Getenv(envVaultSecretID),
 		TLSCertFile:       os.Getenv(envTLSCertFile),
 		TLSKeyFile:        os.Getenv(envTLSKeyFile),
 		MetricsAddr:       os.Getenv(envMetricsAddr),
@@ -226,8 +239,27 @@ func (c *ProxyConfig) validateKMS() error {
 		return fmt.Errorf("config: one of %s or %s is required", envKEK, envVaultAddr)
 	case hasStatic && len(c.KEK) != kekBytes:
 		return fmt.Errorf("config: %s must decode to %d bytes (got %d)", envKEK, kekBytes, len(c.KEK))
-	case hasVault && (c.VaultToken == "" || c.VaultKeyName == ""):
-		return fmt.Errorf("config: %s requires %s and %s", envVaultAddr, envVaultToken, envVaultKeyName)
+	case hasVault:
+		return c.validateVaultAuth()
+	}
+	return nil
+}
+
+// validateVaultAuth checks the Vault Transit settings: a KEK name plus exactly
+// one auth mode — a static token, or an AppRole (both role id and secret id).
+func (c *ProxyConfig) validateVaultAuth() error {
+	if c.VaultKeyName == "" {
+		return fmt.Errorf("config: %s requires %s", envVaultAddr, envVaultKeyName)
+	}
+	hasToken := c.VaultToken != ""
+	hasAppRole := c.VaultRoleID != "" || c.VaultSecretID != ""
+	switch {
+	case hasToken && hasAppRole:
+		return fmt.Errorf("config: set %s or AppRole (%s + %s), not both", envVaultToken, envVaultRoleID, envVaultSecretID)
+	case hasAppRole && (c.VaultRoleID == "" || c.VaultSecretID == ""):
+		return fmt.Errorf("config: AppRole auth requires both %s and %s", envVaultRoleID, envVaultSecretID)
+	case !hasToken && !hasAppRole:
+		return fmt.Errorf("config: %s requires %s or AppRole (%s + %s)", envVaultAddr, envVaultToken, envVaultRoleID, envVaultSecretID)
 	}
 	return nil
 }
