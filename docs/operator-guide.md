@@ -45,7 +45,10 @@ Required for this shape:
   (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via
   `KKP_VAULT_APPROLE_MOUNT`, default `approle`). With AppRole the proxy
   logs in itself and re-authenticates on demand as the token expires, so
-  no long-lived token sits in a Secret. `KKP_KEK` MUST be unset.
+  no long-lived token sits in a Secret. Provision the AppRole with a
+  reusable `secret_id` (avoid `secret_id_num_uses=1` and keep
+  `secret_id_ttl` no shorter than the token TTL) — the proxy reuses the
+  secret id for every on-demand re-login. `KKP_KEK` MUST be unset.
 - `KKP_BACKEND_CA_FILE` + `KKP_BACKEND_SERVER_NAME` pointing at the
   CNPG `*-ca` Secret + the read-write Service DNS.
 - `KKP_TLS_CERT_FILE`/`KKP_TLS_KEY_FILE` for the listener side

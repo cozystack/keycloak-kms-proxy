@@ -66,7 +66,7 @@ The operator-facing guides live under [`docs/`](./docs): [operator-guide](./docs
 
 - **Static KMS** (`KKP_KEK`): a 32-byte AES-256 KEK provided in-cluster as a `Secret`. Suitable for tests and bootstrap.
 - **Vault Transit** (`KKP_VAULT_*`): the KEK lives in Vault. KEK rotation (`vault write -f transit/keys/<key>/rotate`) is transparent to the proxy — the `vault:vN:` version tag on each wrapped DEK lets Vault decrypt across rotations without re-encrypting any column data. Optionally run `vault write transit/rewrap/<key> ciphertext=…` later to bring the stored wrap up to the latest KEK version.
-- **Vault auth**: either a static token (`KKP_VAULT_TOKEN`) or **AppRole** (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via `KKP_VAULT_APPROLE_MOUNT`). With AppRole the proxy performs the login itself and transparently re-authenticates when the issued token expires, so no long-lived token has to sit in a Secret. The proxy touches Vault only at startup and on DEK rotation, so a short-lived AppRole token is sufficient.
+- **Vault auth**: either a static token (`KKP_VAULT_TOKEN`) or **AppRole** (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via `KKP_VAULT_APPROLE_MOUNT`). With AppRole the proxy performs the login itself and transparently re-authenticates when the issued token expires, so no long-lived token has to sit in a Secret. The proxy touches Vault only at startup and on DEK rotation, so a short-lived AppRole token is sufficient. The `secret_id` must stay reusable, though — provision the role without `secret_id_num_uses=1` and with a `secret_id_ttl` no shorter than the token TTL, otherwise the on-demand re-login will fail once the secret id is consumed or expires.
 
 ## Search support
 

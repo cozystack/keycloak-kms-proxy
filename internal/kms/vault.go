@@ -226,6 +226,14 @@ func (a *vaultAuth) currentToken(ctx context.Context) (string, error) {
 		return a.token, nil
 	}
 	if err := a.login(ctx); err != nil {
+		// A proactive re-login (the cached token is still valid but within
+		// renewSkew of expiry) may fail on a transient Vault error. login
+		// leaves the old token in place, so fall back to it while it lasts
+		// rather than failing the request. A hard 403 clears the token via
+		// reauth first, so that path still surfaces the error.
+		if a.token != "" && (a.expiry.IsZero() || time.Now().Before(a.expiry)) {
+			return a.token, nil
+		}
 		return "", err
 	}
 	return a.token, nil

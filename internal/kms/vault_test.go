@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozystack/keycloak-kms-proxy/internal/crypto"
 )
@@ -320,6 +321,54 @@ func TestVaultKMSAuthModeValidation(t *testing.T) {
 		if _, err := NewVaultKMS(cfg); err == nil {
 			t.Errorf("%s: NewVaultKMS accepted an invalid auth config", name)
 		}
+	}
+}
+
+func TestVaultAuthProactiveRenewFallback(t *testing.T) {
+	t.Parallel()
+
+	// A login endpoint that always fails, to simulate a transient Vault error
+	// during a proactive re-login.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"errors":["service unavailable"]}`, http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	a := &vaultAuth{
+		client:   srv.Client(),
+		loginURL: srv.URL + "/v1/auth/approle/login",
+		roleID:   "r",
+		secretID: "s",
+		token:    "still-valid",
+		expiry:   time.Now().Add(renewSkew / 2), // inside renewSkew, but not expired.
+	}
+	got, err := a.currentToken(context.Background())
+	if err != nil {
+		t.Fatalf("currentToken should fall back to the still-valid cached token: %v", err)
+	}
+	if got != "still-valid" {
+		t.Fatalf("got %q, want the cached token", got)
+	}
+}
+
+func TestVaultAuthReauthNoStaleToken(t *testing.T) {
+	t.Parallel()
+
+	// After a hard 403 the token is cleared (reauth); a failing re-login must
+	// surface the error rather than returning a stale token.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+
+	a := &vaultAuth{
+		client:   srv.Client(),
+		loginURL: srv.URL + "/v1/auth/approle/login",
+		roleID:   "r",
+		secretID: "s",
+	}
+	if _, err := a.currentToken(context.Background()); err == nil {
+		t.Fatal("currentToken should fail when login fails and no token is cached")
 	}
 }
 
