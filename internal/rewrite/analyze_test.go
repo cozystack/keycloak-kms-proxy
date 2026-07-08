@@ -163,3 +163,24 @@ func TestAnalyzeErrors(t *testing.T) {
 		t.Error("Analyze accepted multiple statements")
 	}
 }
+
+func TestAnalyzeAllPerStatementSQL(t *testing.T) {
+	t.Parallel()
+
+	analyses, err := AnalyzeAll("select id from realm; select email from user_entity where id = 'u1'")
+	if err != nil {
+		t.Fatalf("AnalyzeAll: %v", err)
+	}
+	if len(analyses) != 2 {
+		t.Fatalf("statements = %d, want 2", len(analyses))
+	}
+	if analyses[0].SQL != "select id from realm" {
+		t.Errorf("first statement SQL = %q", analyses[0].SQL)
+	}
+	if analyses[1].SQL != "select email from user_entity where id = 'u1'" {
+		t.Errorf("second statement SQL = %q", analyses[1].SQL)
+	}
+	if analyses[0].Table != "realm" || analyses[1].Table != "user_entity" {
+		t.Errorf("tables = %q, %q", analyses[0].Table, analyses[1].Table)
+	}
+}

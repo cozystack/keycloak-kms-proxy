@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/jackc/pgproto3/v2"
@@ -250,26 +251,30 @@ func (s *Session) DecryptDataRow(dr *pgproto3.DataRow) error {
 	portal := s.CurrentExecuting()
 	if portal == nil {
 		debugf("kkp: datarow — NO executing portal (race? popped early?) — passthrough %d values", len(dr.Values))
+		flagCiphertextLeak(dr, "no-portal")
 		return nil
 	}
-	if portal.ReadPlan == nil {
+	plan := s.ensureReadPlan(portal)
+	if plan == nil {
 		debugf("kkp: datarow portal=%q stmt=%q — NO read plan built — passthrough", portal.Name, func() string {
 			if portal.Stmt != nil {
 				return portal.Stmt.Name
 			}
 			return ""
 		}())
+		flagCiphertextLeak(dr, "no-plan")
 		return nil
 	}
-	if portal.ReadPlan.IsEmpty() {
+	if plan.IsEmpty() {
+		flagCiphertextLeak(dr, "empty-plan")
 		return nil
 	}
 	if s.cipher == nil {
 		return errNoCipher
 	}
 
-	debugf("kkp: datarow portal=%q decrypting %d fields", portal.Name, len(portal.ReadPlan.Fields))
-	for _, f := range portal.ReadPlan.Fields {
+	debugf("kkp: datarow portal=%q decrypting %d fields", portal.Name, len(plan.Fields))
+	for _, f := range plan.Fields {
 		if f.Index < 0 || f.Index >= len(dr.Values) {
 			continue
 		}
@@ -283,9 +288,34 @@ func (s *Session) DecryptDataRow(dr *pgproto3.DataRow) error {
 			return fmt.Errorf("wire: decrypt field %d (%s.%s): %w", f.Index, f.Table, f.Column, err)
 		}
 		observe.DecryptTotal.WithLabelValues(f.Table, f.Column).Inc()
+		// A decrypted value that still parses as an envelope is a
+		// double-encrypted row: ciphertext leaked to the client during a
+		// passthrough window and was written back as the value. Surface it
+		// for cleanup — the proxy intentionally decrypts only one layer.
+		if _, ok, _ := crypto.Parse(string(plaintext)); ok {
+			observe.DoubleEncrypted.WithLabelValues(f.Table, f.Column).Inc()
+			log.Printf("kkp: WARN decrypted %s.%s still carries a ciphertext envelope — double-encrypted row (written back during a passthrough window)", f.Table, f.Column)
+		}
 		dr.Values[f.Index] = plaintext
 	}
 	return nil
+}
+
+// flagCiphertextLeak fail-louds (metric + WARN) when a DataRow that could not
+// be matched to a decrypt plan carries what looks like one of our ciphertext
+// envelopes — the silent-passthrough failure mode behind the verify-email
+// incident (raw $KKP$ blobs reaching Keycloak).
+func flagCiphertextLeak(dr *pgproto3.DataRow, reason string) {
+	for _, v := range dr.Values {
+		if v == nil {
+			continue
+		}
+		if _, ok, err := crypto.Parse(string(v)); ok || err != nil {
+			observe.CiphertextPassthrough.WithLabelValues(reason).Inc()
+			log.Printf("kkp: WARN ciphertext passed through undecrypted (%s) — read-path gap", reason)
+			return
+		}
+	}
 }
 
 // classifyErr buckets decrypt errors into low-cardinality reasons for the
