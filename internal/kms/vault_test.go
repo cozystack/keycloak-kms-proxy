@@ -372,5 +372,33 @@ func TestVaultAuthReauthNoStaleToken(t *testing.T) {
 	}
 }
 
+func TestVaultKMSAppRoleConcurrent(t *testing.T) {
+	t.Parallel()
+
+	srv, logins := fakeVaultAppRole(t, 1)
+	v := newAppRoleVault(t, srv)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := v.Wrap(context.Background(), []byte("dek")); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Wrap: %v", err)
+	}
+	if got := logins(); got < 1 {
+		t.Fatalf("expected at least one login, got %d", got)
+	}
+}
+
 // VaultKMS must satisfy the KMS interface.
 var _ KMS = (*VaultKMS)(nil)

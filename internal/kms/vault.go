@@ -182,9 +182,11 @@ type vaultAuth struct {
 	roleID   string
 	secretID string
 
-	mu     sync.Mutex
+	mu     sync.Mutex // guards token/expiry; never held across the login I/O.
 	token  string
 	expiry time.Time // zero once logged in => the token does not expire.
+
+	loginMu sync.Mutex // serializes AppRole logins.
 }
 
 // newVaultAuth builds the auth strategy from cfg, enforcing exactly one mode.
@@ -214,29 +216,68 @@ func newVaultAuth(cfg VaultConfig, client *http.Client) (*vaultAuth, error) {
 	}, nil
 }
 
-// currentToken returns a currently valid Vault token, logging in via AppRole
-// when the cached token is absent or within renewSkew of expiry.
+// currentToken returns a valid Vault token, logging in via AppRole when the
+// cached token is missing or within renewSkew of expiry. The login network
+// call is serialized by loginMu and never holds mu, so a caller whose token is
+// still valid is never blocked by an in-flight login.
 func (a *vaultAuth) currentToken(ctx context.Context) (string, error) {
 	if a.loginURL == "" {
 		return a.static, nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.token != "" && (a.expiry.IsZero() || time.Until(a.expiry) > renewSkew) {
-		return a.token, nil
+	if tok, ok := a.freshToken(); ok {
+		return tok, nil
 	}
-	if err := a.login(ctx); err != nil {
-		// A proactive re-login (the cached token is still valid but within
-		// renewSkew of expiry) may fail on a transient Vault error. login
-		// leaves the old token in place, so fall back to it while it lasts
-		// rather than failing the request. A hard 403 clears the token via
-		// reauth first, so that path still surfaces the error.
-		if a.token != "" && (a.expiry.IsZero() || time.Now().Before(a.expiry)) {
-			return a.token, nil
+	if !a.loginMu.TryLock() {
+		// A login is already in flight; keep serving the current token while
+		// it is still usable rather than waiting on the login.
+		if tok, ok := a.usableToken(); ok {
+			return tok, nil
+		}
+		a.loginMu.Lock()
+	}
+	defer a.loginMu.Unlock()
+
+	// Re-check under the login lock: a concurrent login may have just renewed.
+	if tok, ok := a.freshToken(); ok {
+		return tok, nil
+	}
+	tok, expiry, err := a.login(ctx)
+	if err != nil {
+		// A proactive re-login (token still valid but within renewSkew) may
+		// fail transiently; fall back to the still-usable token rather than
+		// failing the request. A hard 403 clears the token via reauth first,
+		// so usableToken returns nothing there and the error surfaces.
+		if fallback, ok := a.usableToken(); ok {
+			return fallback, nil
 		}
 		return "", err
 	}
-	return a.token, nil
+	a.mu.Lock()
+	a.token, a.expiry = tok, expiry
+	a.mu.Unlock()
+	return tok, nil
+}
+
+// freshToken returns the cached token when present and not within renewSkew of
+// expiry.
+func (a *vaultAuth) freshToken() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token != "" && (a.expiry.IsZero() || time.Until(a.expiry) > renewSkew) {
+		return a.token, true
+	}
+	return "", false
+}
+
+// usableToken returns the cached token when present and not yet expired (even
+// if within renewSkew) — the fallback when a re-login fails or is in flight.
+func (a *vaultAuth) usableToken() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token != "" && (a.expiry.IsZero() || time.Now().Before(a.expiry)) {
+		return a.token, true
+	}
+	return "", false
 }
 
 // reauth drops the cached AppRole token so the next token call logs in again.
@@ -247,35 +288,37 @@ func (a *vaultAuth) reauth() bool {
 	}
 	a.mu.Lock()
 	a.token = ""
+	a.expiry = time.Time{}
 	a.mu.Unlock()
 	return true
 }
 
-// login performs an AppRole login and caches the issued token and its TTL.
-// The caller must hold a.mu.
-func (a *vaultAuth) login(ctx context.Context) error {
+// login performs an AppRole login and returns the issued token and its expiry
+// (zero expiry meaning the token does not expire). It does not mutate a, so it
+// runs safely without holding mu during the network call.
+func (a *vaultAuth) login(ctx context.Context) (string, time.Time, error) {
 	reqBody, err := json.Marshal(map[string]string{"role_id": a.roleID, "secret_id": a.secretID})
 	if err != nil {
-		return fmt.Errorf("kms: marshal approle login: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: marshal approle login: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.loginURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("kms: build approle login: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: build approle login: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("kms: approle login request: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: approle login request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("kms: read approle login response: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: read approle login response: %w", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("kms: approle login returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return "", time.Time{}, fmt.Errorf("kms: approle login returned status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 
 	var lr struct {
@@ -285,17 +328,15 @@ func (a *vaultAuth) login(ctx context.Context) error {
 		} `json:"auth"`
 	}
 	if err := json.Unmarshal(body, &lr); err != nil {
-		return fmt.Errorf("kms: decode approle login response: %w", err)
+		return "", time.Time{}, fmt.Errorf("kms: decode approle login response: %w", err)
 	}
 	if lr.Auth.ClientToken == "" {
-		return errors.New("kms: approle login returned an empty client token")
+		return "", time.Time{}, errors.New("kms: approle login returned an empty client token")
 	}
 
-	a.token = lr.Auth.ClientToken
+	var expiry time.Time
 	if lr.Auth.LeaseDuration > 0 {
-		a.expiry = time.Now().Add(time.Duration(lr.Auth.LeaseDuration) * time.Second)
-	} else {
-		a.expiry = time.Time{}
+		expiry = time.Now().Add(time.Duration(lr.Auth.LeaseDuration) * time.Second)
 	}
-	return nil
+	return lr.Auth.ClientToken, expiry, nil
 }
