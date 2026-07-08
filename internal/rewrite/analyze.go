@@ -49,6 +49,10 @@ type ColumnParam struct {
 // to the filtered columns on the read/search path.
 type Analysis struct {
 	Kind StmtKind
+	// SQL is this statement's own text within a multi-statement
+	// simple-protocol query string. Set by AnalyzeAll only; empty for
+	// Analyze, whose callers already hold the (single) statement text.
+	SQL string
 	// Table is the target table (INSERT/UPDATE/DELETE) or the first FROM table
 	// (SELECT). Empty if no single table applies.
 	Table string
@@ -81,8 +85,9 @@ func Analyze(sql string) (*Analysis, error) {
 
 // AnalyzeAll parses a simple-protocol query string, which may carry several
 // semicolon-separated statements, and returns one Analysis per statement in
-// order. The backend answers each statement with its own result cycle, so the
-// wire layer needs one result-queue entry per statement to stay in sync.
+// order, each carrying its own statement text. The backend answers each
+// statement with its own result cycle, so the wire layer needs one
+// result-queue entry per statement to stay in sync.
 func AnalyzeAll(sql string) ([]*Analysis, error) {
 	result, err := pg.Parse(sql)
 	if err != nil {
@@ -91,9 +96,26 @@ func AnalyzeAll(sql string) ([]*Analysis, error) {
 	stmts := result.GetStmts()
 	analyses := make([]*Analysis, 0, len(stmts))
 	for _, st := range stmts {
-		analyses = append(analyses, analyzeNode(st.GetStmt()))
+		a := analyzeNode(st.GetStmt())
+		a.SQL = statementText(sql, st)
+		analyses = append(analyses, a)
 	}
 	return analyses, nil
+}
+
+// statementText slices one statement's own text out of a multi-statement
+// query string using the parser's location/length, so per-statement logging
+// and PII heuristics do not see the neighbouring statements.
+func statementText(sql string, st *pg.RawStmt) string {
+	start := int(st.GetStmtLocation())
+	if start < 0 || start > len(sql) {
+		return sql
+	}
+	end := len(sql)
+	if l := int(st.GetStmtLen()); l > 0 && start+l <= len(sql) {
+		end = start + l
+	}
+	return strings.TrimLeft(sql[start:end], " \t\r\n;")
 }
 
 func analyzeNode(node *pg.Node) *Analysis {

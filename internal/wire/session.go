@@ -221,13 +221,15 @@ func (s *Session) OnQuery(q *pgproto3.Query) error {
 		for _, a := range analyses {
 			plan, perr := s.planner.PlanWrite(a)
 			if perr != nil {
-				debugf("kkp: query FAIL plan: kind=%v table=%q err=%v sql=%q", a.Kind, a.Table, perr, truncate(q.String))
+				debugf("kkp: query FAIL plan: kind=%v table=%q err=%v sql=%q", a.Kind, a.Table, perr, truncate(a.SQL))
 				return fmt.Errorf("wire: simple query: %w", perr)
 			}
-			debugf("kkp: query kind=%v table=%q sql=%q", a.Kind, a.Table, truncate(q.String))
+			debugf("kkp: query kind=%v table=%q sql=%q", a.Kind, a.Table, truncate(a.SQL))
+			// Each entry carries its own statement text so per-statement
+			// logging and the PII heuristics do not see its neighbours.
 			s.execQueue = append(s.execQueue, &Portal{
 				Name: simplePortalName,
-				Stmt: &PreparedStatement{SQL: q.String, Analysis: a, WritePlan: plan},
+				Stmt: &PreparedStatement{SQL: a.SQL, Analysis: a, WritePlan: plan},
 			})
 		}
 	}
