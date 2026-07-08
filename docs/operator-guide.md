@@ -40,9 +40,12 @@ Keycloak ── kkp-proxy Service ──┬── replica 1 ──┐
 Required for this shape:
 
 - `replicas: 2` on the proxy Deployment.
-- `KKP_VAULT_ADDR`, `KKP_VAULT_TOKEN` (or projected ServiceAccount
-  token), `KKP_VAULT_KEY_NAME`, `KKP_VAULT_MOUNT` — `KKP_KEK` MUST be
-  unset.
+- `KKP_VAULT_ADDR`, `KKP_VAULT_KEY_NAME`, `KKP_VAULT_MOUNT`, and Vault
+  auth — either `KKP_VAULT_TOKEN` (a static token) or AppRole
+  (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via
+  `KKP_VAULT_APPROLE_MOUNT`, default `approle`). With AppRole the proxy
+  logs in itself and re-authenticates on demand as the token expires, so
+  no long-lived token sits in a Secret. `KKP_KEK` MUST be unset.
 - `KKP_BACKEND_CA_FILE` + `KKP_BACKEND_SERVER_NAME` pointing at the
   CNPG `*-ca` Secret + the read-write Service DNS.
 - `KKP_TLS_CERT_FILE`/`KKP_TLS_KEY_FILE` for the listener side
@@ -74,7 +77,7 @@ ciphertext.
 | `kc-db-ca` (CNPG-managed name varies) | CNPG operator | CA bundle for `KKP_BACKEND_CA_FILE` so the downstream TLS leg is verified |
 | `kc-db-app` (CNPG default) | CNPG operator | `KKP_BACKEND_PASSWORD` (the credential the proxy uses to authenticate to CNPG) |
 | `keycloak-creds` | operator | Keycloak's own admin password + `KC_DB_PASSWORD` (must match `KKP_UPSTREAM_PASSWORD` because the proxy verifies it on the upstream leg) |
-| Vault token | platform | Either a Kubernetes-projected ServiceAccount token (preferred) or a long-lived Vault token in a Secret |
+| Vault auth | platform | AppRole `role_id`/`secret_id` in a Secret (`KKP_VAULT_ROLE_ID`/`KKP_VAULT_SECRET_ID`, recommended — short-lived tokens minted on demand) or a static Vault token (`KKP_VAULT_TOKEN`) |
 
 ## Required network policies
 
@@ -143,7 +146,9 @@ The list, with a brief intent for each:
 | `KKP_LENIENT` | `true` for bootstrap; **must be `false` in production** |
 | `KKP_KEK` | Static KMS — dev only |
 | `KKP_DEKSET_FILE` | Path to the wrapped DEK set (required so DEK survives restarts) |
-| `KKP_VAULT_ADDR` / `KKP_VAULT_TOKEN` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS — production default |
+| `KKP_VAULT_ADDR` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS — production default |
+| `KKP_VAULT_TOKEN` | Static Vault token auth (mutually exclusive with AppRole) |
+| `KKP_VAULT_ROLE_ID` / `KKP_VAULT_SECRET_ID` / `KKP_VAULT_APPROLE_MOUNT` | Vault AppRole auth — the proxy logs in and re-authenticates on demand (mount default `approle`) |
 | `KKP_TLS_CERT_FILE` / `KKP_TLS_KEY_FILE` | Listener TLS termination |
 | `KKP_BACKEND_CA_FILE` / `KKP_BACKEND_SERVER_NAME` | TLS re-origination to CNPG |
 | `KKP_HEALTH_ADDR` | `/healthz` + `/readyz` endpoint (k8s probes) |

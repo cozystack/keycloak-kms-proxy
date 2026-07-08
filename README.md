@@ -41,7 +41,9 @@ Tagged releases publish a container image to `ghcr.io/cozystack/keycloak-kms-pro
 | `KKP_UPSTREAM_USER` / `KKP_UPSTREAM_PASSWORD` | credential the proxy verifies on the upstream (Keycloak) SCRAM leg |
 | `KKP_BACKEND_USER` / `KKP_BACKEND_PASSWORD` | credential the proxy uses on the downstream (CNPG) SCRAM leg |
 | `KKP_KEK` | base64 32-byte KEK for the static KMS (mutually exclusive with the Vault settings below) |
-| `KKP_VAULT_ADDR` / `KKP_VAULT_TOKEN` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS settings |
+| `KKP_VAULT_ADDR` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS settings |
+| `KKP_VAULT_TOKEN` | static Vault token auth (mutually exclusive with AppRole below) |
+| `KKP_VAULT_ROLE_ID` / `KKP_VAULT_SECRET_ID` / `KKP_VAULT_APPROLE_MOUNT` | Vault AppRole auth: the proxy logs in and re-authenticates on demand (mount defaults to `approle`) |
 | `KKP_DEKSET_FILE` | path to a JSON-encoded wrapped DEK set (lets the proxy and the backfill tool share a key) |
 | `KKP_FIELDS` | `disabled`, `email-only`, or empty for the full default set |
 | `KKP_LENIENT` | `true` downgrades fail-loud rules to passthrough — required for the Keycloak Liquibase bootstrap window only, must be off in steady state |
@@ -64,6 +66,7 @@ The operator-facing guides live under [`docs/`](./docs): [operator-guide](./docs
 
 - **Static KMS** (`KKP_KEK`): a 32-byte AES-256 KEK provided in-cluster as a `Secret`. Suitable for tests and bootstrap.
 - **Vault Transit** (`KKP_VAULT_*`): the KEK lives in Vault. KEK rotation (`vault write -f transit/keys/<key>/rotate`) is transparent to the proxy — the `vault:vN:` version tag on each wrapped DEK lets Vault decrypt across rotations without re-encrypting any column data. Optionally run `vault write transit/rewrap/<key> ciphertext=…` later to bring the stored wrap up to the latest KEK version.
+- **Vault auth**: either a static token (`KKP_VAULT_TOKEN`) or **AppRole** (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via `KKP_VAULT_APPROLE_MOUNT`). With AppRole the proxy performs the login itself and transparently re-authenticates when the issued token expires, so no long-lived token has to sit in a Secret. The proxy touches Vault only at startup and on DEK rotation, so a short-lived AppRole token is sufficient.
 
 ## Search support
 
