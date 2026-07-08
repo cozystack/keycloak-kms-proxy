@@ -395,8 +395,8 @@ func TestVaultKMSAppRoleConcurrent(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("concurrent Wrap: %v", err)
 	}
-	if got := logins(); got < 1 {
-		t.Fatalf("expected at least one login, got %d", got)
+	if got := logins(); got != 1 {
+		t.Fatalf("concurrent cold-start Wraps must serialize to exactly one login, got %d", got)
 	}
 }
 

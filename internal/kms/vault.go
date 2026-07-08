@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -137,7 +138,7 @@ func (v *VaultKMS) post(ctx context.Context, url string, reqBody, respOut any) e
 		if derr != nil {
 			return derr
 		}
-		if status == http.StatusForbidden && attempt < maxPostAttempts && v.auth.reauth() {
+		if status == http.StatusForbidden && attempt < maxPostAttempts && v.auth.reauth(token) {
 			continue
 		}
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
@@ -246,8 +247,12 @@ func (a *vaultAuth) currentToken(ctx context.Context) (string, error) {
 		// A proactive re-login (token still valid but within renewSkew) may
 		// fail transiently; fall back to the still-usable token rather than
 		// failing the request. A hard 403 clears the token via reauth first,
-		// so usableToken returns nothing there and the error surfaces.
+		// so usableToken returns nothing there and the error surfaces. Warn
+		// loudly: if the login is permanently broken (expired secret_id,
+		// revoked policy) the next DEK operation after the cached token dies
+		// will fail, so an operator needs to see this before rotation time.
 		if fallback, ok := a.usableToken(); ok {
+			log.Printf("kkp: WARN vault re-login failed; serving the cached token until it expires: %v", err)
 			return fallback, nil
 		}
 		return "", err
@@ -280,15 +285,20 @@ func (a *vaultAuth) usableToken() (string, bool) {
 	return "", false
 }
 
-// reauth drops the cached AppRole token so the next token call logs in again.
-// It reports whether re-authentication is possible (false for static tokens).
-func (a *vaultAuth) reauth() bool {
+// reauth drops the cached AppRole token so the next token call logs in again,
+// but only if the cache still holds stale — the token that was just rejected.
+// A concurrent goroutine may have already refreshed it, and wiping the fresh
+// token would force a needless extra login. It reports whether re-auth is
+// possible (false for static tokens).
+func (a *vaultAuth) reauth(stale string) bool {
 	if a.loginURL == "" {
 		return false
 	}
 	a.mu.Lock()
-	a.token = ""
-	a.expiry = time.Time{}
+	if a.token == stale {
+		a.token = ""
+		a.expiry = time.Time{}
+	}
 	a.mu.Unlock()
 	return true
 }
