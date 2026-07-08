@@ -54,11 +54,21 @@ var (
 		Name: "kkp_ciphertext_passthrough_total",
 		Help: "DataRows passed through undecrypted despite carrying a ciphertext envelope, by reason.",
 	}, []string{"reason"})
+
+	// DoubleEncrypted counts decrypted values that still carry a ciphertext
+	// envelope: rows whose stored value IS a leaked ciphertext (written back
+	// by the client during a passthrough window and encrypted again). Used
+	// to inventory corrupted rows for cleanup.
+	DoubleEncrypted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kkp_double_encrypted_total",
+		Help: "Decrypted values still carrying a ciphertext envelope (double-encrypted rows), by table/column.",
+	}, []string{"table", "column"})
 )
 
 func init() {
 	prometheus.MustRegister(
 		DecryptTotal, DecryptFailures, EncryptTotal,
 		UnrecognizedPIISQL, KMSCallTotal, CiphertextPassthrough,
+		DoubleEncrypted,
 	)
 }

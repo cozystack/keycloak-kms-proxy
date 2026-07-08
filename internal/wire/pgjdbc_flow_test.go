@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/jackc/pgproto3/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/cozystack/keycloak-kms-proxy/internal/observe"
 	"github.com/cozystack/keycloak-kms-proxy/internal/rewrite"
 )
 
@@ -392,4 +394,42 @@ func TestErrorInBatchKeepsPipelinedBatch(t *testing.T) {
 	}
 	s.OnCommandComplete()
 	s.OnReadyForQuery()
+}
+
+// TestDecryptDataRowFlagsDoubleEncrypted: a stored value that decrypts into
+// another envelope is a corrupted row — ciphertext leaked during a
+// passthrough window and written back as the value. The proxy decrypts one
+// layer, returns the inner envelope, and inventories the row via the
+// kkp_double_encrypted_total counter.
+func TestDecryptDataRowFlagsDoubleEncrypted(t *testing.T) {
+	t.Parallel()
+
+	s := newEncryptingSession(t)
+	if err := s.OnParse(&pgproto3.Parse{Name: "S_1", Query: keycloakUserSelect}); err != nil {
+		t.Fatalf("OnParse: %v", err)
+	}
+	s.OnDescribe(&pgproto3.Describe{ObjectType: 'S', Name: "S_1"})
+	s.OnBind(&pgproto3.Bind{DestinationPortal: "C_1", PreparedStatement: "S_1"})
+	s.OnExecute(&pgproto3.Execute{Portal: "C_1"})
+	s.OnSync()
+	s.OnRowDescription(userSelectRowDescription())
+
+	inner := string(storedEmail(t, s, "olga@example.com"))
+	outer, err := s.cipher.Encrypt(0 /*deterministic*/, []byte(inner), rewrite.AAD("USER_ENTITY", "EMAIL"))
+	if err != nil {
+		t.Fatalf("Encrypt(outer): %v", err)
+	}
+
+	before := testutil.ToFloat64(observe.DoubleEncrypted.WithLabelValues("USER_ENTITY", "EMAIL"))
+	dr := &pgproto3.DataRow{Values: [][]byte{[]byte("u1"), []byte(outer), []byte("olga")}}
+	if err := s.DecryptDataRow(dr); err != nil {
+		t.Fatalf("DecryptDataRow: %v", err)
+	}
+	if string(dr.Values[1]) != inner {
+		t.Fatalf("double-encrypted value = %q, want one decryption layer removed (%q)", dr.Values[1], inner)
+	}
+	after := testutil.ToFloat64(observe.DoubleEncrypted.WithLabelValues("USER_ENTITY", "EMAIL"))
+	if after != before+1 {
+		t.Fatalf("kkp_double_encrypted_total = %v, want %v", after, before+1)
+	}
 }

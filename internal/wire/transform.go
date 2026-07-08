@@ -288,6 +288,14 @@ func (s *Session) DecryptDataRow(dr *pgproto3.DataRow) error {
 			return fmt.Errorf("wire: decrypt field %d (%s.%s): %w", f.Index, f.Table, f.Column, err)
 		}
 		observe.DecryptTotal.WithLabelValues(f.Table, f.Column).Inc()
+		// A decrypted value that still parses as an envelope is a
+		// double-encrypted row: ciphertext leaked to the client during a
+		// passthrough window and was written back as the value. Surface it
+		// for cleanup — the proxy intentionally decrypts only one layer.
+		if _, ok, _ := crypto.Parse(string(plaintext)); ok {
+			observe.DoubleEncrypted.WithLabelValues(f.Table, f.Column).Inc()
+			log.Printf("kkp: WARN decrypted %s.%s still carries a ciphertext envelope — double-encrypted row (written back during a passthrough window)", f.Table, f.Column)
+		}
 		dr.Values[f.Index] = plaintext
 	}
 	return nil
