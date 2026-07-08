@@ -45,11 +45,20 @@ var (
 		Name: "kkp_kms_calls_total",
 		Help: "Calls to the KMS (Encrypt/Decrypt of DEKs), by op and outcome.",
 	}, []string{"op", "outcome"})
+
+	// CiphertextPassthrough counts DataRows that left the proxy still
+	// carrying a ciphertext envelope because no decrypt plan matched, by
+	// reason. Any non-zero value is an incident: the client saw raw $KKP$
+	// blobs (the verify-email failure class).
+	CiphertextPassthrough = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kkp_ciphertext_passthrough_total",
+		Help: "DataRows passed through undecrypted despite carrying a ciphertext envelope, by reason.",
+	}, []string{"reason"})
 )
 
 func init() {
 	prometheus.MustRegister(
 		DecryptTotal, DecryptFailures, EncryptTotal,
-		UnrecognizedPIISQL, KMSCallTotal,
+		UnrecognizedPIISQL, KMSCallTotal, CiphertextPassthrough,
 	)
 }

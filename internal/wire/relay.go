@@ -65,8 +65,14 @@ func (s *Session) observeFrontend(msg pgproto3.FrontendMessage) error {
 	case *pgproto3.Bind:
 		s.OnBind(m)
 		return s.EncryptBind(m)
+	case *pgproto3.Describe:
+		s.OnDescribe(m)
 	case *pgproto3.Execute:
 		s.OnExecute(m)
+	case *pgproto3.Sync:
+		s.OnSync()
+	case *pgproto3.Query:
+		return s.OnQuery(m)
 	case *pgproto3.Close:
 		s.OnClose(m)
 	}
@@ -83,14 +89,20 @@ func (s *Session) observeBackend(msg pgproto3.BackendMessage) error {
 	switch m := msg.(type) {
 	case *pgproto3.RowDescription:
 		s.OnRowDescription(m)
+	case *pgproto3.NoData:
+		s.OnNoData()
 	case *pgproto3.DataRow:
 		return s.DecryptDataRow(m)
 	case *pgproto3.CommandComplete:
 		s.OnCommandComplete()
+	case *pgproto3.PortalSuspended:
+		s.OnPortalSuspended()
 	case *pgproto3.EmptyQueryResponse:
 		s.OnEmptyQueryResponse()
 	case *pgproto3.ErrorResponse:
 		s.OnErrorResponse()
+	case *pgproto3.ReadyForQuery:
+		s.OnReadyForQuery()
 	}
 	return nil
 }
