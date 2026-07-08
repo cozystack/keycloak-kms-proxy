@@ -52,6 +52,61 @@ func TestProxyConfigValidateKEKLength(t *testing.T) {
 	}
 }
 
+// vaultProxyConfig returns a valid config using Vault Transit (no static KEK).
+func vaultProxyConfig() *ProxyConfig {
+	c := validProxyConfig()
+	c.KEK = nil
+	c.VaultAddr = "http://vault:8200"
+	c.VaultKeyName = "keycloak-kek"
+	return c
+}
+
+func TestProxyConfigValidateVaultAppRole(t *testing.T) {
+	t.Parallel()
+
+	c := vaultProxyConfig()
+	c.VaultRoleID = "role-abc"
+	c.VaultSecretID = "secret-xyz"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected a valid AppRole config: %v", err)
+	}
+}
+
+func TestProxyConfigValidateVaultKubernetes(t *testing.T) {
+	t.Parallel()
+
+	c := vaultProxyConfig()
+	c.VaultKubernetesRole = "keycloak-proxy"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected a valid Kubernetes-auth config: %v", err)
+	}
+}
+
+func TestProxyConfigValidateVaultAuthMisconfig(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]func(*ProxyConfig){
+		"token and approle": func(c *ProxyConfig) {
+			c.VaultToken, c.VaultRoleID, c.VaultSecretID = "t", "r", "s"
+		},
+		"token and kubernetes": func(c *ProxyConfig) {
+			c.VaultToken, c.VaultKubernetesRole = "t", "r"
+		},
+		"approle and kubernetes": func(c *ProxyConfig) {
+			c.VaultRoleID, c.VaultSecretID, c.VaultKubernetesRole = "r", "s", "r"
+		},
+		"approle missing secret id": func(c *ProxyConfig) { c.VaultRoleID = "r" },
+		"no auth at all":            func(c *ProxyConfig) {},
+	}
+	for name, mutate := range cases {
+		c := vaultProxyConfig()
+		mutate(c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: Validate accepted an invalid Vault auth config", name)
+		}
+	}
+}
+
 func TestLoadProxyConfigFromEnv(t *testing.T) {
 	kek := base64.StdEncoding.EncodeToString(make([]byte, kekBytes))
 	t.Setenv(envListenAddr, ":5432")

@@ -41,7 +41,10 @@ Tagged releases publish a container image to `ghcr.io/cozystack/keycloak-kms-pro
 | `KKP_UPSTREAM_USER` / `KKP_UPSTREAM_PASSWORD` | credential the proxy verifies on the upstream (Keycloak) SCRAM leg |
 | `KKP_BACKEND_USER` / `KKP_BACKEND_PASSWORD` | credential the proxy uses on the downstream (CNPG) SCRAM leg |
 | `KKP_KEK` | base64 32-byte KEK for the static KMS (mutually exclusive with the Vault settings below) |
-| `KKP_VAULT_ADDR` / `KKP_VAULT_TOKEN` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS settings |
+| `KKP_VAULT_ADDR` / `KKP_VAULT_KEY_NAME` / `KKP_VAULT_MOUNT` | Vault Transit KMS settings |
+| `KKP_VAULT_KUBERNETES_ROLE` / `KKP_VAULT_KUBERNETES_MOUNT` / `KKP_VAULT_KUBERNETES_JWT_FILE` | Vault Kubernetes auth (**recommended**): the proxy logs in with its projected ServiceAccount token (mount defaults to `kubernetes`, JWT file to the standard in-pod path) |
+| `KKP_VAULT_ROLE_ID` / `KKP_VAULT_SECRET_ID` / `KKP_VAULT_APPROLE_MOUNT` | Vault AppRole auth: the proxy logs in and re-authenticates on demand (mount defaults to `approle`) |
+| `KKP_VAULT_TOKEN` | static Vault token auth (mutually exclusive with the AppRole / Kubernetes options) |
 | `KKP_DEKSET_FILE` | path to a JSON-encoded wrapped DEK set (lets the proxy and the backfill tool share a key) |
 | `KKP_FIELDS` | `disabled`, `email-only`, or empty for the full default set |
 | `KKP_LENIENT` | `true` downgrades fail-loud rules to passthrough — required for the Keycloak Liquibase bootstrap window only, must be off in steady state |
@@ -64,6 +67,12 @@ The operator-facing guides live under [`docs/`](./docs): [operator-guide](./docs
 
 - **Static KMS** (`KKP_KEK`): a 32-byte AES-256 KEK provided in-cluster as a `Secret`. Suitable for tests and bootstrap.
 - **Vault Transit** (`KKP_VAULT_*`): the KEK lives in Vault. KEK rotation (`vault write -f transit/keys/<key>/rotate`) is transparent to the proxy — the `vault:vN:` version tag on each wrapped DEK lets Vault decrypt across rotations without re-encrypting any column data. Optionally run `vault write transit/rewrap/<key> ciphertext=…` later to bring the stored wrap up to the latest KEK version.
+- **Vault auth** — exactly one of, all logging in on demand and re-authenticating as the issued token expires (the proxy touches Vault only at startup and on DEK rotation, so a short-lived token is fine):
+  - **Kubernetes** (`KKP_VAULT_KUBERNETES_ROLE`; mount via `KKP_VAULT_KUBERNETES_MOUNT`, default `kubernetes`; JWT via `KKP_VAULT_KUBERNETES_JWT_FILE`, default the standard in-pod ServiceAccount token path) — **recommended**. The proxy logs in with its projected ServiceAccount token, re-read from disk each login so the kubelet's rotation is picked up. No long-lived credential is stored.
+  - **AppRole** (`KKP_VAULT_ROLE_ID` + `KKP_VAULT_SECRET_ID`, mount via `KKP_VAULT_APPROLE_MOUNT`). The `secret_id` must stay reusable — provision the role without `secret_id_num_uses=1` and with a `secret_id_ttl` no shorter than the token TTL, otherwise the on-demand re-login fails once the secret id is consumed or expires.
+  - **Static token** (`KKP_VAULT_TOKEN`) — simplest; a long-lived token in a Secret.
+
+  For all methods give a `token_ttl` comfortably above the 30s renew skew, and point `KKP_VAULT_ADDR` at an HTTPS endpoint — credentials travel on every login.
 
 ## Search support
 

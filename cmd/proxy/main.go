@@ -177,10 +177,17 @@ func buildCipher(ctx context.Context, cfg *config.ProxyConfig) (*crypto.Cipher, 
 func buildKMS(cfg *config.ProxyConfig) (kms.KMS, error) {
 	if cfg.VaultAddr != "" {
 		return kms.NewVaultKMS(kms.VaultConfig{
-			Address: cfg.VaultAddr,
-			Token:   cfg.VaultToken,
-			KeyName: cfg.VaultKeyName,
-			Mount:   cfg.VaultMount,
+			Address:      cfg.VaultAddr,
+			Token:        cfg.VaultToken,
+			KeyName:      cfg.VaultKeyName,
+			Mount:        cfg.VaultMount,
+			AppRoleMount: cfg.VaultAppRoleMount,
+			RoleID:       cfg.VaultRoleID,
+			SecretID:     cfg.VaultSecretID,
+
+			KubernetesRole:    cfg.VaultKubernetesRole,
+			KubernetesMount:   cfg.VaultKubernetesMount,
+			KubernetesJWTFile: cfg.VaultKubernetesJWTFile,
 		})
 	}
 	return kms.NewStaticKMS(cfg.KEK)
