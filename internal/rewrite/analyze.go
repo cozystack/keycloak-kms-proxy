@@ -76,19 +76,38 @@ func Analyze(sql string) (*Analysis, error) {
 	if len(stmts) != 1 {
 		return nil, fmt.Errorf("rewrite: expected exactly one statement, got %d", len(stmts))
 	}
+	return analyzeNode(stmts[0].GetStmt()), nil
+}
 
-	node := stmts[0].GetStmt()
+// AnalyzeAll parses a simple-protocol query string, which may carry several
+// semicolon-separated statements, and returns one Analysis per statement in
+// order. The backend answers each statement with its own result cycle, so the
+// wire layer needs one result-queue entry per statement to stay in sync.
+func AnalyzeAll(sql string) ([]*Analysis, error) {
+	result, err := pg.Parse(sql)
+	if err != nil {
+		return nil, fmt.Errorf("rewrite: parse: %w", err)
+	}
+	stmts := result.GetStmts()
+	analyses := make([]*Analysis, 0, len(stmts))
+	for _, st := range stmts {
+		analyses = append(analyses, analyzeNode(st.GetStmt()))
+	}
+	return analyses, nil
+}
+
+func analyzeNode(node *pg.Node) *Analysis {
 	switch {
 	case node.GetInsertStmt() != nil:
-		return analyzeInsert(node.GetInsertStmt()), nil
+		return analyzeInsert(node.GetInsertStmt())
 	case node.GetUpdateStmt() != nil:
-		return analyzeUpdate(node.GetUpdateStmt()), nil
+		return analyzeUpdate(node.GetUpdateStmt())
 	case node.GetSelectStmt() != nil:
-		return analyzeSelect(node.GetSelectStmt()), nil
+		return analyzeSelect(node.GetSelectStmt())
 	case node.GetDeleteStmt() != nil:
-		return analyzeDelete(node.GetDeleteStmt()), nil
+		return analyzeDelete(node.GetDeleteStmt())
 	default:
-		return &Analysis{Kind: KindOther}, nil
+		return &Analysis{Kind: KindOther}
 	}
 }
 
