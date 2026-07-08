@@ -269,8 +269,7 @@ func (s *Session) OnRowDescription(rd *pgproto3.RowDescription) {
 	}
 
 	if len(s.describes) > 0 && !s.describes[0].boundary {
-		pd := s.describes[0]
-		s.describes = s.describes[1:]
+		pd := s.popDescribe()
 		if pd.stmt == nil {
 			debugf("kkp: rowdesc — describe of unknown statement/portal, skipping decrypt-plan build")
 			return
@@ -342,8 +341,26 @@ func (s *Session) ensureReadPlan(p *Portal) *rewrite.ReadPlan {
 // returns no rows, keeping later RowDescriptions attributed correctly.
 func (s *Session) OnNoData() {
 	if len(s.describes) > 0 && !s.describes[0].boundary {
-		s.describes = s.describes[1:]
+		s.popDescribe()
 	}
+}
+
+// popDescribe removes and returns the head describe entry, zeroing the slot
+// so the backing array does not pin the referenced statement and portal.
+func (s *Session) popDescribe() pendingDescribe {
+	pd := s.describes[0]
+	s.describes[0] = pendingDescribe{}
+	s.describes = s.describes[1:]
+	return pd
+}
+
+// popExec removes and returns the head execute entry, zeroing the slot so
+// the backing array does not pin the popped portal.
+func (s *Session) popExec() *Portal {
+	p := s.execQueue[0]
+	s.execQueue[0] = nil
+	s.execQueue = s.execQueue[1:]
+	return p
 }
 
 // piiTouchedButNotPlanned reports whether the SQL textually mentions one of
@@ -414,10 +431,10 @@ func (s *Session) OnPortalSuspended() { s.popExecuting() }
 // the boundary belong to pipelined later batches and stay.
 func (s *Session) OnErrorResponse() {
 	for len(s.execQueue) > 0 && s.execQueue[0] != syncBoundary {
-		s.execQueue = s.execQueue[1:]
+		s.popExec()
 	}
 	for len(s.describes) > 0 && !s.describes[0].boundary {
-		s.describes = s.describes[1:]
+		s.popDescribe()
 	}
 }
 
@@ -427,17 +444,13 @@ func (s *Session) OnErrorResponse() {
 func (s *Session) OnReadyForQuery() {
 	dead := 0
 	for len(s.execQueue) > 0 {
-		head := s.execQueue[0]
-		s.execQueue = s.execQueue[1:]
-		if head == syncBoundary {
+		if s.popExec() == syncBoundary {
 			break
 		}
 		dead++
 	}
 	for len(s.describes) > 0 {
-		head := s.describes[0]
-		s.describes = s.describes[1:]
-		if head.boundary {
+		if s.popDescribe().boundary {
 			break
 		}
 		dead++
@@ -449,7 +462,7 @@ func (s *Session) OnReadyForQuery() {
 
 func (s *Session) popExecuting() {
 	if len(s.execQueue) > 0 && s.execQueue[0] != syncBoundary {
-		s.execQueue = s.execQueue[1:]
+		s.popExec()
 	}
 }
 
