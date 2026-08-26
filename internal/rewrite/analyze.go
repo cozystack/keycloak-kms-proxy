@@ -54,8 +54,19 @@ type Analysis struct {
 	// Analyze, whose callers already hold the (single) statement text.
 	SQL string
 	// Table is the target table (INSERT/UPDATE/DELETE) or the first FROM table
-	// (SELECT). Empty if no single table applies.
+	// (SELECT). Empty if no single table applies — notably when the FROM
+	// clause is a join, whose first item is the join expression rather than a
+	// range variable.
 	Table string
+	// FromTables lists every base relation the statement reads, with join
+	// trees, sub-selects and set-operation arms walked; for
+	// INSERT/UPDATE/DELETE it is the target relation. The read planner
+	// resolves each result column against this set, so a result set assembled
+	// by a join still decrypts: Keycloak's group-members listing
+	// (USER_GROUP_MEMBERSHIP join USER_ENTITY) selects every USER_ENTITY
+	// column and used to hand Keycloak raw envelopes because Table is empty
+	// for a join.
+	FromTables []string
 	// WriteColumns are the columns whose values are written: INSERT column list
 	// and UPDATE SET targets, each with the parameter position of its value.
 	WriteColumns []ColumnParam
@@ -135,6 +146,7 @@ func analyzeNode(node *pg.Node) *Analysis {
 
 func analyzeInsert(ins *pg.InsertStmt) *Analysis {
 	a := &Analysis{Kind: KindInsert, Table: ins.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 
 	var params []int
 	if sel := ins.GetSelectStmt().GetSelectStmt(); sel != nil && len(sel.GetValuesLists()) > 0 {
@@ -155,6 +167,7 @@ func analyzeInsert(ins *pg.InsertStmt) *Analysis {
 
 func analyzeUpdate(upd *pg.UpdateStmt) *Analysis {
 	a := &Analysis{Kind: KindUpdate, Table: upd.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 	for _, t := range upd.GetTargetList() {
 		rt := t.GetResTarget()
 		a.WriteColumns = append(a.WriteColumns, ColumnParam{Column: rt.GetName(), Param: paramNumber(rt.GetVal())})
@@ -170,12 +183,68 @@ func analyzeSelect(sel *pg.SelectStmt) *Analysis {
 			a.Table = rv.GetRelname()
 		}
 	}
+	a.FromTables = selectTables(sel)
 	a.FilterColumns, a.LikeFilterColumns = whereColumns(sel.GetWhereClause())
 	return a
 }
 
+// targetTables wraps a write statement's target relation as its (single) read
+// source, so a RETURNING result set decrypts like any other read.
+func targetTables(table string) []string {
+	if table == "" {
+		return nil
+	}
+	return []string{table}
+}
+
+// selectTables collects every base relation a SELECT reads from, in the order
+// they appear, without duplicates.
+func selectTables(sel *pg.SelectStmt) []string {
+	var tables []string
+	seen := make(map[string]bool)
+	collectSelectTables(sel, &tables, seen)
+	return tables
+}
+
+// collectSelectTables walks a SELECT and its set-operation arms (UNION and
+// friends), descending into every FROM item.
+func collectSelectTables(sel *pg.SelectStmt, tables *[]string, seen map[string]bool) {
+	if sel == nil {
+		return
+	}
+	collectSelectTables(sel.GetLarg(), tables, seen)
+	collectSelectTables(sel.GetRarg(), tables, seen)
+	for _, item := range sel.GetFromClause() {
+		collectFromItem(item, tables, seen)
+	}
+}
+
+// collectFromItem walks one FROM item: a range variable is a base relation, a
+// join expression has two sides, and a sub-select carries its own FROM clause.
+func collectFromItem(n *pg.Node, tables *[]string, seen map[string]bool) {
+	if n == nil {
+		return
+	}
+	switch {
+	case n.GetRangeVar() != nil:
+		name := n.GetRangeVar().GetRelname()
+		if name == "" || seen[strings.ToUpper(name)] {
+			return
+		}
+		seen[strings.ToUpper(name)] = true
+		*tables = append(*tables, name)
+	case n.GetJoinExpr() != nil:
+		je := n.GetJoinExpr()
+		collectFromItem(je.GetLarg(), tables, seen)
+		collectFromItem(je.GetRarg(), tables, seen)
+	case n.GetRangeSubselect() != nil:
+		collectSelectTables(n.GetRangeSubselect().GetSubquery().GetSelectStmt(), tables, seen)
+	}
+}
+
 func analyzeDelete(del *pg.DeleteStmt) *Analysis {
 	a := &Analysis{Kind: KindDelete, Table: del.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 	a.FilterColumns, a.LikeFilterColumns = whereColumns(del.GetWhereClause())
 	return a
 }
