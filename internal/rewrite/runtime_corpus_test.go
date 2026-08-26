@@ -158,3 +158,65 @@ func TestRuntimeCorpusPIICoverage(t *testing.T) {
 	}
 	t.Logf("runtime corpus covers %d PII-touching statements", pii)
 }
+
+// TestRuntimeCorpusFromTableCoverage — every PII relation a SELECT reads from
+// must show up in `FromTables`, whatever shape the FROM clause takes.
+//
+// TestRuntimeCorpusPIICoverage above keys off the *captured* table column, so a
+// statement whose table the proxy already failed to extract is skipped by the
+// very gate meant to catch it. That blind spot is how the group-members read
+// (USER_GROUP_MEMBERSHIP join USER_ENTITY) shipped: recorded with an empty
+// table, skipped by the conformance test, and leaking every USER_ENTITY column
+// as a raw envelope in production. This test reads the SQL instead.
+func TestRuntimeCorpusFromTableCoverage(t *testing.T) {
+	t.Parallel()
+	cases := loadRuntimeCorpus(t)
+	joined := 0
+	for _, c := range cases {
+		a, err := Analyze(c.SQL)
+		if err != nil || a.Kind != KindSelect {
+			continue // parse failures are reported by their own test.
+		}
+		if len(a.FromTables) > 1 {
+			joined++
+		}
+		for tbl := range piiTables {
+			if !readsFrom(c.SQL, tbl) || containsFold(a.FromTables, tbl) {
+				continue
+			}
+			t.Errorf("SELECT reads %s but it is missing from FromTables=%v (silent-passthrough hazard)\n  sql=%s",
+				tbl, a.FromTables, truncateSQL(c.SQL, 200))
+		}
+	}
+	if joined == 0 {
+		t.Fatal("no multi-relation SELECT in the corpus — the joined read path is uncovered")
+	}
+	t.Logf("runtime corpus covers %d multi-relation SELECTs", joined)
+}
+
+// readsFrom reports whether the SQL names the relation right after a FROM or
+// JOIN keyword — the positions that put it in the result set's scope. A
+// mention inside a WHERE sub-query does not count: those rows never reach the
+// client, so they need no decrypt plan.
+func readsFrom(sql, table string) bool {
+	fields := strings.Fields(strings.ToLower(sql))
+	for i := 1; i < len(fields); i++ {
+		prev := fields[i-1]
+		if prev != "from" && prev != "join" {
+			continue
+		}
+		if strings.TrimLeft(fields[i], "(") == strings.ToLower(table) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(list []string, want string) bool {
+	for _, s := range list {
+		if strings.EqualFold(s, want) {
+			return true
+		}
+	}
+	return false
+}
