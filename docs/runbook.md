@@ -107,6 +107,28 @@ kubectl delete ns $NS
 # apply your proxy Deployment/Service/Secret manifests here
 ```
 
+### Recovering from a read-path ciphertext leak
+
+If a read-path gap let raw `$KKP$` envelopes reach Keycloak (symptom:
+`kkp_ciphertext_passthrough_total` climbing, by `reason` — `empty-plan`,
+`no-plan`, `no-portal`, or `ambiguous-column`), Keycloak's user cache stores the
+ciphertext and serves it back on later reads, and any row Keycloak then writes
+back carries a leaked ciphertext as its value (a double-encrypted row).
+
+After rolling out the proxy version that closes the gap:
+
+1. Flush Keycloak's user cache so it re-reads through the fixed proxy — the
+   `clear-user-cache` step above (section 4, step 1). Until this runs, cached
+   ciphertext keeps being served.
+2. Confirm the incident is actually closed before standing down: watch
+   `kkp_ciphertext_passthrough_total` stay flat, and check
+   `kkp_double_encrypted_total` — any non-zero value inventories rows that were
+   written back while the leak was open and need cleanup (delete/re-save via the
+   admin REST API, as in section 4, step 2). The encrypt path now refuses to
+   re-encrypt a value that already parses as an envelope, so no *new*
+   double-encrypted rows are produced once the fix is live; the counter only
+   reflects the backlog.
+
 ## 5. Recovery: proxy down
 
 The Service IP routes to the running replicas via the regular Service

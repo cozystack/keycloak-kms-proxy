@@ -112,7 +112,8 @@ func TestPlanReadJoinedTables(t *testing.T) {
 // TestPlanReadAmbiguousColumnSkipped: when two joined relations both configure
 // the same column, the proxy cannot tell which AAD the value was sealed with.
 // Guessing would fail the authentication tag and error the whole query, so the
-// field is left for the passthrough detector to flag.
+// field is not decrypted — but it is carried in plan.Ambiguous (not silently
+// dropped) so DecryptDataRow can count and warn on any envelope it still holds.
 func TestPlanReadAmbiguousColumnSkipped(t *testing.T) {
 	t.Parallel()
 
@@ -122,11 +123,18 @@ func TestPlanReadAmbiguousColumnSkipped(t *testing.T) {
 	fs.SetColumn("FED_USER_ENTITY", "EMAIL", rule)
 
 	p := NewPlanner(fs)
-	if plan := p.PlanRead([]string{"user_entity", "fed_user_entity"}, []string{"email"}); !plan.IsEmpty() {
-		t.Fatalf("ambiguous column planned anyway: %+v", plan.Fields)
+	plan := p.PlanRead([]string{"user_entity", "fed_user_entity"}, []string{"email"})
+	if len(plan.Fields) != 0 {
+		t.Fatalf("ambiguous column decrypted anyway: %+v", plan.Fields)
+	}
+	if len(plan.Ambiguous) != 1 || plan.Ambiguous[0].Column != "EMAIL" || plan.Ambiguous[0].Index != 0 {
+		t.Fatalf("ambiguous column not carried through the plan: %+v", plan.Ambiguous)
+	}
+	if plan.IsEmpty() {
+		t.Fatal("plan with an ambiguous field reports empty; the leak detector would never see it")
 	}
 	// Unambiguous on its own.
-	if plan := p.PlanRead([]string{"user_entity"}, []string{"email"}); len(plan.Fields) != 1 {
-		t.Fatalf("single-table read lost its field: %+v", plan.Fields)
+	if plan := p.PlanRead([]string{"user_entity"}, []string{"email"}); len(plan.Fields) != 1 || len(plan.Ambiguous) != 0 {
+		t.Fatalf("single-table read lost its field or misclassified it: %+v", plan)
 	}
 }

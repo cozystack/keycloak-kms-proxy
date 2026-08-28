@@ -230,6 +230,16 @@ func (s *Session) encryptParam(b *pgproto3.Bind, pr rewrite.ParamRule) error {
 		return nil // SQL NULL.
 	}
 
+	// Fail loud instead of double-encrypting: a value that already parses as a
+	// valid ciphertext envelope is a leaked ciphertext being written back
+	// (e.g. after a read-path passthrough window), not user plaintext. Keycloak
+	// never sends a well-formed $KKP$ envelope as a PII value, so refusing here
+	// cannot break the normal encrypt path.
+	if _, ok, _ := crypto.Parse(string(value)); ok {
+		return fmt.Errorf("wire: refusing to encrypt $%d (%s.%s): value already carries a ciphertext envelope (double-encryption; a leaked ciphertext written back)",
+			pr.Param, pr.Table, pr.Column)
+	}
+
 	plaintext := value
 	if pr.Rule.LowercaseNormalize {
 		plaintext = []byte(crypto.NormalizeLowercase(string(value)))
@@ -268,6 +278,17 @@ func (s *Session) DecryptDataRow(dr *pgproto3.DataRow) error {
 	if plan.IsEmpty() {
 		flagCiphertextLeak(dr, "empty-plan")
 		return nil
+	}
+
+	// A column claimed by more than one joined relation is ambiguous: the proxy
+	// cannot know which relation's associated data sealed it, so it is left
+	// undecrypted. A non-empty plan (some other column resolved) means the
+	// whole-row empty-plan detector above never sees it, so count and warn here
+	// — an ambiguous-skip leak must never be silent.
+	flagAmbiguousPassthrough(dr, plan.Ambiguous)
+
+	if len(plan.Fields) == 0 {
+		return nil // only ambiguous fields: nothing to decrypt.
 	}
 	if s.cipher == nil {
 		return errNoCipher
@@ -313,6 +334,29 @@ func flagCiphertextLeak(dr *pgproto3.DataRow, reason string) {
 		if _, ok, err := crypto.Parse(string(v)); ok || err != nil {
 			observe.CiphertextPassthrough.WithLabelValues(reason).Inc()
 			log.Printf("kkp: WARN ciphertext passed through undecrypted (%s) — read-path gap", reason)
+			return
+		}
+	}
+}
+
+// flagAmbiguousPassthrough counts and warns when an ambiguous PII column — one
+// claimed by more than one joined relation, so the proxy cannot resolve which
+// associated data sealed it — reaches the client still carrying a ciphertext
+// envelope. A non-empty read plan hides this from the whole-row empty-plan
+// detector, so it is accounted for explicitly. Counts once per DataRow, matching
+// kkp_ciphertext_passthrough_total's per-row unit.
+func flagAmbiguousPassthrough(dr *pgproto3.DataRow, ambiguous []rewrite.ReadField) {
+	for _, f := range ambiguous {
+		if f.Index < 0 || f.Index >= len(dr.Values) {
+			continue
+		}
+		v := dr.Values[f.Index]
+		if v == nil {
+			continue
+		}
+		if _, ok, err := crypto.Parse(string(v)); ok || err != nil {
+			observe.CiphertextPassthrough.WithLabelValues("ambiguous-column").Inc()
+			log.Printf("kkp: WARN ciphertext passed through undecrypted (ambiguous-column) — column %q is claimed by multiple joined relations, associated data unknown", f.Column)
 			return
 		}
 	}

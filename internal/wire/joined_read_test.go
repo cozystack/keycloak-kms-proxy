@@ -1,11 +1,13 @@
 package wire
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/cozystack/keycloak-kms-proxy/internal/config"
 	"github.com/cozystack/keycloak-kms-proxy/internal/crypto"
 	"github.com/cozystack/keycloak-kms-proxy/internal/observe"
 	"github.com/cozystack/keycloak-kms-proxy/internal/rewrite"
@@ -154,9 +156,14 @@ func TestJoinedSelectReuseDecrypts(t *testing.T) {
 // TestJoinedSelectLeavesNoCiphertextPassthrough asserts the incident counter
 // stays flat: it is the signal production alerts on, and it was the only
 // evidence the group-members read was leaking.
+//
+// Deliberately NOT t.Parallel(): it Reset()s the process-global
+// kkp_ciphertext_passthrough_total counter and reads kkp_unrecognized_pii_sql_total,
+// so running alongside another test that touches those metrics would race.
+// Go runs the non-parallel tests one at a time before any parallel test
+// resumes, which keeps these globals to this test for its duration.
 func TestJoinedSelectLeavesNoCiphertextPassthrough(t *testing.T) {
 	observe.CiphertextPassthrough.Reset()
-	observe.UnrecognizedPIISQL.Add(0)
 	before := testutil.ToFloat64(observe.UnrecognizedPIISQL)
 
 	s := newEncryptingSession(t)
@@ -177,5 +184,62 @@ func TestJoinedSelectLeavesNoCiphertextPassthrough(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(observe.UnrecognizedPIISQL) - before; got != 0 {
 		t.Errorf("joined PII SELECT still counted as unrecognised %v times", got)
+	}
+}
+
+// ambiguousJoinSelect joins two relations that both configure EMAIL as PII and
+// selects EMAIL (ambiguous — the proxy cannot know which relation's associated
+// data sealed it) alongside USERNAME (owned only by USER_ENTITY, so it still
+// decrypts). Before the fix the ambiguous EMAIL was dropped from a non-empty
+// plan and left the proxy as a raw envelope with nothing counted or logged.
+const ambiguousJoinSelect = "select ue.USERNAME,ue.EMAIL " +
+	"from USER_ENTITY ue join FED_USER_ENTITY fue on fue.ID=ue.ID"
+
+// TestJoinedAmbiguousColumnCountsPassthrough is the finding-1 regression: a join
+// carrying one ambiguous and one unambiguous PII column must still increment
+// kkp_ciphertext_passthrough_total for the ambiguous skip, and must decrypt the
+// unambiguous column.
+//
+// Deliberately NOT t.Parallel(): like TestJoinedSelectLeavesNoCiphertextPassthrough
+// it Reset()s the process-global kkp_ciphertext_passthrough_total counter.
+func TestJoinedAmbiguousColumnCountsPassthrough(t *testing.T) {
+	observe.CiphertextPassthrough.Reset()
+
+	fs := config.New()
+	fs.SetColumn("USER_ENTITY", "USERNAME", config.Rule{Scheme: crypto.SchemeDeterministic})
+	fs.SetColumn("USER_ENTITY", "EMAIL", config.Rule{Scheme: crypto.SchemeNonDeterministic})
+	fs.SetColumn("FED_USER_ENTITY", "EMAIL", config.Rule{Scheme: crypto.SchemeNonDeterministic})
+	s := NewSession(rewrite.NewPlanner(fs), newTestCipher(t))
+
+	if err := s.OnParse(&pgproto3.Parse{Name: "S_amb", Query: ambiguousJoinSelect}); err != nil {
+		t.Fatalf("OnParse: %v", err)
+	}
+	s.OnDescribe(&pgproto3.Describe{ObjectType: 'S', Name: "S_amb"})
+	s.OnBind(&pgproto3.Bind{DestinationPortal: "C_1", PreparedStatement: "S_amb"})
+	s.OnExecute(&pgproto3.Execute{Portal: "C_1"})
+	s.OnSync()
+	s.OnRowDescription(rowDescriptionFor([]string{"username", "email"}))
+
+	dr := &pgproto3.DataRow{Values: [][]byte{
+		storedValue(t, s, crypto.SchemeDeterministic, "USER_ENTITY", "USERNAME", "ivy"),
+		// The ambiguous EMAIL is a genuine envelope; which relation sealed it is
+		// exactly what the proxy cannot know, so it stays raw in the output.
+		storedValue(t, s, crypto.SchemeNonDeterministic, "USER_ENTITY", "EMAIL", "ivy@example.test"),
+	}}
+	if err := s.DecryptDataRow(dr); err != nil {
+		t.Fatalf("DecryptDataRow: %v", err)
+	}
+
+	// Unambiguous column decrypts.
+	if got := string(dr.Values[0]); got != "ivy" {
+		t.Errorf("username not decrypted on ambiguous join: got %q, want %q", got, "ivy")
+	}
+	// Ambiguous column is left as a raw envelope, not guessed at.
+	if got := string(dr.Values[1]); !strings.HasPrefix(got, "$KKP$") {
+		t.Errorf("ambiguous email should stay a raw envelope, got %q", got)
+	}
+	// The incident counter fires exactly once for the ambiguous skip.
+	if leaked := testutil.ToFloat64(observe.CiphertextPassthrough.WithLabelValues("ambiguous-column")); leaked != 1 {
+		t.Errorf("kkp_ciphertext_passthrough_total{reason=\"ambiguous-column\"} = %v, want 1", leaked)
 	}
 }

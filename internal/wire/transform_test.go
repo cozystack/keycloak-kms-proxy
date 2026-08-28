@@ -227,6 +227,28 @@ func TestEncryptBindLikeEscapedWildcardsTreatedLiteral(t *testing.T) {
 	}
 }
 
+// TestEncryptBindRefusesDoubleEncryption: a value that already parses as a
+// ciphertext envelope is a leaked ciphertext being written back, not user
+// plaintext. Encrypting it again would produce a double-encrypted row, so the
+// write path fails loud instead.
+func TestEncryptBindRefusesDoubleEncryption(t *testing.T) {
+	t.Parallel()
+
+	s := newEncryptingSession(t)
+	if err := s.OnParse(&pgproto3.Parse{Name: "ins", Query: "INSERT INTO user_entity (email) VALUES ($1)"}); err != nil {
+		t.Fatalf("OnParse: %v", err)
+	}
+	// A genuine envelope, as a leaked ciphertext read back by Keycloak would be.
+	envelope, err := s.cipher.Encrypt(0 /*deterministic*/, []byte("dana@example.com"), rewrite.AAD("USER_ENTITY", "EMAIL"))
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	b := &pgproto3.Bind{PreparedStatement: "ins", Parameters: [][]byte{[]byte(envelope)}}
+	if err := s.EncryptBind(b); err == nil {
+		t.Fatal("EncryptBind accepted an already-encrypted value; double-encryption not refused")
+	}
+}
+
 func TestEncryptBindNullPassthrough(t *testing.T) {
 	t.Parallel()
 
