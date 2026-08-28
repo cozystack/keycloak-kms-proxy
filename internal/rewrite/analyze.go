@@ -53,9 +53,23 @@ type Analysis struct {
 	// simple-protocol query string. Set by AnalyzeAll only; empty for
 	// Analyze, whose callers already hold the (single) statement text.
 	SQL string
-	// Table is the target table (INSERT/UPDATE/DELETE) or the first FROM table
-	// (SELECT). Empty if no single table applies.
+	// Table is the target table (INSERT/UPDATE/DELETE) or, for a SELECT, the
+	// first FROM item when that item is a plain range variable. It is empty
+	// when the first FROM item is an explicit JOIN expression, whose first
+	// child is the join rather than a relation. A comma join (FROM a, b) keeps
+	// Table non-empty, but it names only the first of several relations —
+	// prefer FromTables, which lists them all. Table is retained for the write
+	// path and the conformance corpus.
 	Table string
+	// FromTables lists every base relation the statement reads, with join
+	// trees, sub-selects and set-operation arms walked and CTE references
+	// resolved to their underlying relations; for INSERT/UPDATE/DELETE it is
+	// the target relation. The read planner resolves each result column against
+	// this set, so a result set assembled by a join still decrypts: Keycloak's
+	// group-members listing (USER_GROUP_MEMBERSHIP join USER_ENTITY) selects
+	// every USER_ENTITY column and used to hand Keycloak raw envelopes because
+	// Table is empty for a join.
+	FromTables []string
 	// WriteColumns are the columns whose values are written: INSERT column list
 	// and UPDATE SET targets, each with the parameter position of its value.
 	WriteColumns []ColumnParam
@@ -135,6 +149,7 @@ func analyzeNode(node *pg.Node) *Analysis {
 
 func analyzeInsert(ins *pg.InsertStmt) *Analysis {
 	a := &Analysis{Kind: KindInsert, Table: ins.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 
 	var params []int
 	if sel := ins.GetSelectStmt().GetSelectStmt(); sel != nil && len(sel.GetValuesLists()) > 0 {
@@ -155,6 +170,7 @@ func analyzeInsert(ins *pg.InsertStmt) *Analysis {
 
 func analyzeUpdate(upd *pg.UpdateStmt) *Analysis {
 	a := &Analysis{Kind: KindUpdate, Table: upd.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 	for _, t := range upd.GetTargetList() {
 		rt := t.GetResTarget()
 		a.WriteColumns = append(a.WriteColumns, ColumnParam{Column: rt.GetName(), Param: paramNumber(rt.GetVal())})
@@ -170,12 +186,125 @@ func analyzeSelect(sel *pg.SelectStmt) *Analysis {
 			a.Table = rv.GetRelname()
 		}
 	}
+	a.FromTables = selectTables(sel)
 	a.FilterColumns, a.LikeFilterColumns = whereColumns(sel.GetWhereClause())
 	return a
 }
 
+// targetTables returns a write statement's target relation as its lone read
+// source, so a plain RETURNING result set decrypts like any other read. It
+// does not walk an UPDATE ... FROM / DELETE ... USING auxiliary relation, so a
+// RETURNING column drawn from one of those is not resolved — Keycloak issues no
+// such statement against a PII table, and the read-path leak detector would
+// flag any envelope that slipped through.
+func targetTables(table string) []string {
+	if table == "" {
+		return nil
+	}
+	return []string{table}
+}
+
+// selectTables collects every base relation a SELECT reads from, in the order
+// they appear, without duplicates. CTE references are resolved to the relations
+// their query reads rather than reported as base tables.
+func selectTables(sel *pg.SelectStmt) []string {
+	c := &tableCollector{seen: make(map[string]bool), cteActive: make(map[string]bool)}
+	c.walkSelect(sel, nil)
+	return c.tables
+}
+
+// tableCollector accumulates the base relations of a SELECT. seen deduplicates
+// the result; cteActive guards against a WITH RECURSIVE cycle while a CTE
+// reference is being resolved.
+type tableCollector struct {
+	tables    []string
+	seen      map[string]bool
+	cteActive map[string]bool
+}
+
+// walkSelect descends a SELECT, its set-operation arms (UNION and friends) and
+// its FROM items. ctes is the CTE scope in effect, extended by this select's
+// own WITH clause; a nested WITH shadows outer names.
+func (c *tableCollector) walkSelect(sel *pg.SelectStmt, ctes map[string]*pg.SelectStmt) {
+	if sel == nil {
+		return
+	}
+	ctes = extendCTEScope(ctes, sel.GetWithClause())
+	c.walkSelect(sel.GetLarg(), ctes)
+	c.walkSelect(sel.GetRarg(), ctes)
+	for _, item := range sel.GetFromClause() {
+		c.walkFromItem(item, ctes)
+	}
+}
+
+// walkFromItem walks one FROM item: a range variable is a base relation (or a
+// CTE reference to resolve), a join expression has two sides, and a sub-select
+// carries its own FROM clause.
+func (c *tableCollector) walkFromItem(n *pg.Node, ctes map[string]*pg.SelectStmt) {
+	if n == nil {
+		return
+	}
+	switch {
+	case n.GetRangeVar() != nil:
+		c.addRelation(n.GetRangeVar().GetRelname(), ctes)
+	case n.GetJoinExpr() != nil:
+		je := n.GetJoinExpr()
+		c.walkFromItem(je.GetLarg(), ctes)
+		c.walkFromItem(je.GetRarg(), ctes)
+	case n.GetRangeSubselect() != nil:
+		c.walkSelect(n.GetRangeSubselect().GetSubquery().GetSelectStmt(), ctes)
+	}
+}
+
+// addRelation records a base relation, or resolves a CTE reference to the
+// relations its query reads — a CTE alias is never reported as a base table.
+func (c *tableCollector) addRelation(name string, ctes map[string]*pg.SelectStmt) {
+	if name == "" {
+		return
+	}
+	key := strings.ToUpper(name)
+	if q, ok := ctes[key]; ok {
+		if c.cteActive[key] {
+			return // WITH RECURSIVE self-reference: already resolving it.
+		}
+		c.cteActive[key] = true
+		c.walkSelect(q, ctes)
+		delete(c.cteActive, key)
+		return
+	}
+	if c.seen[key] {
+		return
+	}
+	c.seen[key] = true
+	c.tables = append(c.tables, name)
+}
+
+// extendCTEScope returns the CTE scope augmented with a WITH clause's CTEs,
+// mapping each upper-cased CTE name to its query. The parent scope is left
+// untouched so sibling selects do not see this level's names.
+func extendCTEScope(parent map[string]*pg.SelectStmt, wc *pg.WithClause) map[string]*pg.SelectStmt {
+	if wc == nil || len(wc.GetCtes()) == 0 {
+		return parent
+	}
+	scope := make(map[string]*pg.SelectStmt, len(parent)+len(wc.GetCtes()))
+	for k, v := range parent {
+		scope[k] = v
+	}
+	for _, node := range wc.GetCtes() {
+		cte := node.GetCommonTableExpr()
+		if cte == nil {
+			continue
+		}
+		if q := cte.GetCtequery().GetSelectStmt(); q != nil {
+			scope[strings.ToUpper(cte.GetCtename())] = q
+		}
+	}
+	return scope
+}
+
 func analyzeDelete(del *pg.DeleteStmt) *Analysis {
 	a := &Analysis{Kind: KindDelete, Table: del.GetRelation().GetRelname()}
+	a.FromTables = targetTables(a.Table)
 	a.FilterColumns, a.LikeFilterColumns = whereColumns(del.GetWhereClause())
 	return a
 }

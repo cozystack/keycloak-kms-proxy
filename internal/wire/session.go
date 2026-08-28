@@ -299,15 +299,15 @@ func (s *Session) OnRowDescription(rd *pgproto3.RowDescription) {
 func (s *Session) learnColumns(ps *PreparedStatement, columns []string) {
 	ps.Columns = columns
 	plan := s.planRead(ps, columns)
-	table := ""
+	var tables []string
 	if ps.Analysis != nil {
-		table = ps.Analysis.Table
+		tables = ps.Analysis.FromTables
 	}
 	fields := 0
 	if plan != nil {
 		fields = len(plan.Fields)
 	}
-	debugf("kkp: rowdesc stmt=%q table=%q cols=%v readPlanFields=%d", ps.Name, table, columns, fields)
+	debugf("kkp: rowdesc stmt=%q tables=%v cols=%v readPlanFields=%d", ps.Name, tables, columns, fields)
 
 	if (plan == nil || plan.IsEmpty()) && piiTouchedButNotPlanned(ps.SQL, columns) {
 		observe.UnrecognizedPIISQL.Inc()
@@ -322,7 +322,7 @@ func (s *Session) planRead(ps *PreparedStatement, columns []string) *rewrite.Rea
 	if ps.Analysis == nil {
 		return nil
 	}
-	return s.planner.PlanRead(ps.Analysis.Table, columns)
+	return s.planner.PlanRead(ps.Analysis.FromTables, columns)
 }
 
 // ensureReadPlan resolves a portal's decrypt plan, deriving it from the
