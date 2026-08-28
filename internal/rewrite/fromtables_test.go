@@ -97,6 +97,52 @@ func TestAnalyzeFromTablesDeduplicatesSelfJoin(t *testing.T) {
 	}
 }
 
+// TestAnalyzeFromTablesCTE: a CTE alias is not a base relation. `FROM m` must
+// resolve to the relations the CTE's query reads (USER_ENTITY), never report
+// the alias `m` — which would leave the read planner unable to decrypt and
+// (worse) misrepresent what the statement actually touches.
+func TestAnalyzeFromTablesCTE(t *testing.T) {
+	t.Parallel()
+
+	a, err := Analyze(`with m as (select ue.EMAIL from USER_ENTITY ue) select x.EMAIL from m x`)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if want := []string{"user_entity"}; !eqTables(a.FromTables, want) {
+		t.Errorf("from tables: got %v, want %v (CTE alias must resolve to its base relation)", a.FromTables, want)
+	}
+}
+
+// TestAnalyzeFromTablesCTEJoinedWithBase: a CTE reference joined with a real
+// relation resolves the CTE to its underlying table and keeps the base table,
+// in order, without the alias.
+func TestAnalyzeFromTablesCTEJoinedWithBase(t *testing.T) {
+	t.Parallel()
+
+	a, err := Analyze(`with m as (select fue.USER_ID from FED_USER_ENTITY fue) ` +
+		`select u.EMAIL from USER_ENTITY u join m on m.USER_ID=u.ID`)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if want := []string{"user_entity", "fed_user_entity"}; !eqTables(a.FromTables, want) {
+		t.Errorf("from tables: got %v, want %v", a.FromTables, want)
+	}
+}
+
+// TestAnalyzeFromTablesRecursiveCTETerminates: a WITH RECURSIVE self-reference
+// must not send the walker into an infinite loop.
+func TestAnalyzeFromTablesRecursiveCTETerminates(t *testing.T) {
+	t.Parallel()
+
+	a, err := Analyze(`with recursive m as (select ue.ID from USER_ENTITY ue union all select ue2.ID from USER_ENTITY ue2 join m on m.ID=ue2.ID) select ID from m`)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if want := []string{"user_entity"}; !eqTables(a.FromTables, want) {
+		t.Errorf("from tables: got %v, want %v", a.FromTables, want)
+	}
+}
+
 func TestAnalyzeFromTablesOnWrites(t *testing.T) {
 	t.Parallel()
 

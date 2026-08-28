@@ -12,7 +12,13 @@
 //     target fails the test instead of silently falling into passthrough);
 //   - for PII-touching SQL specifically, the proxy either built a write
 //     plan (INSERT/UPDATE) or will build a read plan when the RowDescription
-//     arrives (i.e. `Table` is non-empty).
+//     arrives (i.e. `Table` is non-empty);
+//   - every PII relation a SELECT reads (whatever the FROM shape — join,
+//     comma join, sub-select, set operation, CTE) appears in `FromTables`
+//     (TestRuntimeCorpusFromTableCoverage), so a joined read cannot slip past
+//     the single-table gate above and leak ciphertext;
+//   - the corpus itself is a reproducible set: no (Kind, Table, SQL) tuple
+//     repeats (TestRuntimeCorpusUnique), matching what the generator emits.
 //
 // On a Keycloak upgrade: regenerate the golden via
 // `examples/encryption-demo/`-style capture, review the diff in the PR.
@@ -23,6 +29,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	pg "github.com/pganalyze/pg_query_go/v6"
 )
 
 const runtimeCorpusPath = "../../testdata/keycloak/26.0.0/runtime-sql.txt"
@@ -180,12 +188,14 @@ func TestRuntimeCorpusFromTableCoverage(t *testing.T) {
 		if len(a.FromTables) > 1 {
 			joined++
 		}
-		for tbl := range piiTables {
-			if !readsFrom(c.SQL, tbl) || containsFold(a.FromTables, tbl) {
+		for _, rel := range expectedReadRelations(t, c.SQL) {
+			if _, ok := piiTables[strings.ToLower(rel)]; !ok {
 				continue
 			}
-			t.Errorf("SELECT reads %s but it is missing from FromTables=%v (silent-passthrough hazard)\n  sql=%s",
-				tbl, a.FromTables, truncateSQL(c.SQL, 200))
+			if !containsFold(a.FromTables, rel) {
+				t.Errorf("SELECT reads PII relation %s but it is missing from FromTables=%v (silent-passthrough hazard)\n  sql=%s",
+					rel, a.FromTables, truncateSQL(c.SQL, 200))
+			}
 		}
 	}
 	if joined == 0 {
@@ -194,22 +204,120 @@ func TestRuntimeCorpusFromTableCoverage(t *testing.T) {
 	t.Logf("runtime corpus covers %d multi-relation SELECTs", joined)
 }
 
-// readsFrom reports whether the SQL names the relation right after a FROM or
-// JOIN keyword — the positions that put it in the result set's scope. A
-// mention inside a WHERE sub-query does not count: those rows never reach the
-// client, so they need no decrypt plan.
-func readsFrom(sql, table string) bool {
-	fields := strings.Fields(strings.ToLower(sql))
-	for i := 1; i < len(fields); i++ {
-		prev := fields[i-1]
-		if prev != "from" && prev != "join" {
+// TestRuntimeCorpusUnique — the golden corpus must be reproducible by its
+// generator (cmd/capture-keycloak-sql), which dedups statements into a
+// map[stmt]struct{} keyed on (Kind, Table, SQL) and writes the sorted set. A
+// repeated tuple in the file could therefore never be regenerated, so guard
+// against one creeping back in on the next capture/merge.
+func TestRuntimeCorpusUnique(t *testing.T) {
+	t.Parallel()
+	seen := make(map[runtimeCase]int)
+	for i, c := range loadRuntimeCorpus(t) {
+		if first, dup := seen[c]; dup {
+			t.Errorf("duplicate corpus entry (lines %d and %d): %s %s\n  sql=%s",
+				first+1, i+1, c.Kind, c.Table, truncateSQL(c.SQL, 200))
 			continue
 		}
-		if strings.TrimLeft(fields[i], "(") == strings.ToLower(table) {
-			return true
+		seen[c] = i
+	}
+}
+
+// expectedReadRelations parses a SELECT and returns the base relations in its
+// result scope, independently of analyze.go: every relation named in a FROM
+// clause (walking joins, comma joins, FROM sub-selects and set-operation arms,
+// resolving CTE references to their underlying relations), and nothing that
+// appears only in a WHERE sub-query — those rows never reach the client, so
+// they need no decrypt plan. It is deliberately a second implementation of the
+// walk in analyze.go, so this gate cross-checks FromTables rather than trusting
+// the code it is testing; a string literal that merely contains the word "from"
+// is a constant node, never a relation, so it cannot produce a false positive.
+func expectedReadRelations(t *testing.T, sql string) []string {
+	t.Helper()
+	res, err := pg.Parse(sql)
+	if err != nil {
+		t.Fatalf("oracle parse %q: %v", sql, err)
+	}
+	o := &readOracle{seen: map[string]bool{}, active: map[string]bool{}}
+	for _, raw := range res.GetStmts() {
+		if sel := raw.GetStmt().GetSelectStmt(); sel != nil {
+			o.walkSelect(sel, nil)
 		}
 	}
-	return false
+	return o.rels
+}
+
+// readOracle is the conformance test's independent relation collector. seen
+// deduplicates; active guards a WITH RECURSIVE cycle.
+type readOracle struct {
+	rels   []string
+	seen   map[string]bool
+	active map[string]bool
+}
+
+func (o *readOracle) walkSelect(sel *pg.SelectStmt, ctes map[string]*pg.SelectStmt) {
+	if sel == nil {
+		return
+	}
+	ctes = oracleCTEScope(ctes, sel.GetWithClause())
+	o.walkSelect(sel.GetLarg(), ctes)
+	o.walkSelect(sel.GetRarg(), ctes)
+	for _, item := range sel.GetFromClause() {
+		o.walkFrom(item, ctes)
+	}
+}
+
+func (o *readOracle) walkFrom(n *pg.Node, ctes map[string]*pg.SelectStmt) {
+	if n == nil {
+		return
+	}
+	switch {
+	case n.GetRangeVar() != nil:
+		o.add(n.GetRangeVar().GetRelname(), ctes)
+	case n.GetJoinExpr() != nil:
+		o.walkFrom(n.GetJoinExpr().GetLarg(), ctes)
+		o.walkFrom(n.GetJoinExpr().GetRarg(), ctes)
+	case n.GetRangeSubselect() != nil:
+		o.walkSelect(n.GetRangeSubselect().GetSubquery().GetSelectStmt(), ctes)
+	}
+}
+
+func (o *readOracle) add(name string, ctes map[string]*pg.SelectStmt) {
+	if name == "" {
+		return
+	}
+	key := strings.ToUpper(name)
+	if q, ok := ctes[key]; ok {
+		if o.active[key] {
+			return
+		}
+		o.active[key] = true
+		o.walkSelect(q, ctes)
+		delete(o.active, key)
+		return
+	}
+	if o.seen[key] {
+		return
+	}
+	o.seen[key] = true
+	o.rels = append(o.rels, name)
+}
+
+func oracleCTEScope(parent map[string]*pg.SelectStmt, wc *pg.WithClause) map[string]*pg.SelectStmt {
+	if wc == nil || len(wc.GetCtes()) == 0 {
+		return parent
+	}
+	scope := make(map[string]*pg.SelectStmt, len(parent)+len(wc.GetCtes()))
+	for k, v := range parent {
+		scope[k] = v
+	}
+	for _, node := range wc.GetCtes() {
+		if cte := node.GetCommonTableExpr(); cte != nil {
+			if q := cte.GetCtequery().GetSelectStmt(); q != nil {
+				scope[strings.ToUpper(cte.GetCtename())] = q
+			}
+		}
+	}
+	return scope
 }
 
 func containsFold(list []string, want string) bool {
